@@ -557,6 +557,11 @@ static NSWindow* __weak _deferredResignKeyWindow;
   NSRange availableTextRange =
       NSMakeRange(_availableTextOffset, _availableText.length());
 
+  // If the available text window has moved past the correction, computing
+  // its window-relative position below would underflow.
+  if (correction.range.location < _availableTextOffset)
+    return;
+
   if (NSMaxRange(correction.range) > NSMaxRange(availableTextRange))
     return;
 

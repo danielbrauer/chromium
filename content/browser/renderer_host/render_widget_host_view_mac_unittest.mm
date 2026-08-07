@@ -212,6 +212,21 @@ using SpellCheckerCompletionHandlerType = void (
 - (void)dismissCorrectionIndicatorForView:(NSView*)view {
 }
 
+- (BOOL)preventsAutocorrectionBeforeString:(NSString*)string
+                                  language:(NSString*)language {
+  return NO;
+}
+
+@end
+
+// -didAcceptReplacementString:… is private to RenderWidgetHostViewCocoa. The
+// text substitution tests below drive it directly: AppKit decides when to
+// invoke it, so there is no way to reach it from a unit test through the
+// public interface.
+@interface RenderWidgetHostViewCocoa (TextSubstitutionsTesting)
+- (void)didAcceptReplacementString:(NSString*)acceptedString
+             forTextCheckingResult:(NSTextCheckingResult*)correction
+                  withChangeNumber:(NSUInteger)changeNumber;
 @end
 
 namespace content {
@@ -2468,6 +2483,105 @@ TEST_F(InputMethodMacTest, TouchBarTextSuggestionsInvalidSelection) {
   // If the selection changed to a bogus value, expect the machinery to have
   // bailed out early and not ended up requesting suggestions.
   EXPECT_EQ(firstSequenceNumber, secondSequenceNumber);
+}
+
+// The tests below cover the text substitutions accept path. A correction is
+// computed against the available text window as it stood when the correction
+// indicator was shown, but it is applied later, when AppKit reports that the
+// user accepted it. The window may have moved in between, so the accept path
+// has to re-check the correction against the current window before using it to
+// index into the text.
+
+// Sanity check for the two tests that follow: a correction that still lies
+// inside the available text window is applied.
+TEST_F(InputMethodMacTest, TextSubstitutionAppliedWithinAvailableTextWindow) {
+  FakeSpellChecker* spellChecker = [[FakeSpellChecker alloc] init];
+  tab_GetInProcessNSView().spellCheckerForTesting =
+      static_cast<NSSpellChecker*>(spellChecker);
+  SetTextInputType(tab_view(), ui::TEXT_INPUT_TYPE_TEXT);
+
+  // The available text window holds "omw home" starting at document offset 10.
+  const std::u16string kAvailableText = u"omw home";
+  tab_view()->SelectionChanged(kAvailableText, 10, gfx::Range(13, 13));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  // "omw" occupies document range [10, 13), which is inside the window.
+  FakeTextCheckingResult* correction =
+      [FakeTextCheckingResult resultWithRange:NSMakeRange(10, 3)
+                            replacementString:@"On my way"];
+
+  [tab_GetInProcessNSView()
+      didAcceptReplacementString:@"On my way"
+           forTextCheckingResult:static_cast<NSTextCheckingResult*>(correction)
+                withChangeNumber:0];
+  base::RunLoop().RunUntilIdle();
+
+  MockWidgetInputHandler::MessageVector events =
+      host_->GetAndResetDispatchedMessages();
+  EXPECT_EQ("CommitText", GetMessageNames(events));
+}
+
+// Regression test: if the window has scrolled past the correction entirely,
+// the correction's position relative to the window is negative. Computing it
+// underflows NSUInteger and the subsequent -substringWithRange: raises.
+TEST_F(InputMethodMacTest, TextSubstitutionIgnoredWhenWindowMovedPast) {
+  FakeSpellChecker* spellChecker = [[FakeSpellChecker alloc] init];
+  tab_GetInProcessNSView().spellCheckerForTesting =
+      static_cast<NSSpellChecker*>(spellChecker);
+  SetTextInputType(tab_view(), ui::TEXT_INPUT_TYPE_TEXT);
+
+  // The window now starts at document offset 40, well past the correction.
+  const std::u16string kAvailableText = u"omw home";
+  tab_view()->SelectionChanged(kAvailableText, 40, gfx::Range(43, 43));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  // The correction still refers to document range [10, 13), which is below the
+  // window. Note this passes the upper bound check: 13 is less than the
+  // window's end at 48.
+  FakeTextCheckingResult* correction =
+      [FakeTextCheckingResult resultWithRange:NSMakeRange(10, 3)
+                            replacementString:@"On my way"];
+
+  [tab_GetInProcessNSView()
+      didAcceptReplacementString:@"On my way"
+           forTextCheckingResult:static_cast<NSTextCheckingResult*>(correction)
+                withChangeNumber:0];
+  base::RunLoop().RunUntilIdle();
+
+  MockWidgetInputHandler::MessageVector events =
+      host_->GetAndResetDispatchedMessages();
+  EXPECT_EQ("", GetMessageNames(events));
+}
+
+// The mirror image of the above, covering the bound the accept path already
+// checked, so that a later change cannot drop one without the other.
+TEST_F(InputMethodMacTest, TextSubstitutionIgnoredWhenExtendingPastWindow) {
+  FakeSpellChecker* spellChecker = [[FakeSpellChecker alloc] init];
+  tab_GetInProcessNSView().spellCheckerForTesting =
+      static_cast<NSSpellChecker*>(spellChecker);
+  SetTextInputType(tab_view(), ui::TEXT_INPUT_TYPE_TEXT);
+
+  const std::u16string kAvailableText = u"omw home";
+  tab_view()->SelectionChanged(kAvailableText, 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  // The correction runs to document offset 15, past the window's end at 8.
+  FakeTextCheckingResult* correction =
+      [FakeTextCheckingResult resultWithRange:NSMakeRange(5, 10)
+                            replacementString:@"On my way"];
+
+  [tab_GetInProcessNSView()
+      didAcceptReplacementString:@"On my way"
+           forTextCheckingResult:static_cast<NSTextCheckingResult*>(correction)
+                withChangeNumber:0];
+  base::RunLoop().RunUntilIdle();
+
+  MockWidgetInputHandler::MessageVector events =
+      host_->GetAndResetDispatchedMessages();
+  EXPECT_EQ("", GetMessageNames(events));
 }
 
 // This test verifies that in AutoResize mode a child-allocated
