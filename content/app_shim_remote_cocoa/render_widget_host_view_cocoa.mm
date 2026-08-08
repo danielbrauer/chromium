@@ -81,6 +81,8 @@ constexpr NSString* const WebAutomaticDashSubstitutionEnabled =
     @"WebAutomaticDashSubstitutionEnabled";
 constexpr NSString* const WebAutomaticTextReplacementEnabled =
     @"WebAutomaticTextReplacementEnabled";
+constexpr NSString* const WebAutomaticSpellingCorrectionEnabled =
+    @"WebAutomaticSpellingCorrectionEnabled";
 
 // Cap on typed insertions still owing a substitution check, in case their
 // text updates never arrive; a stale check is harmless, an unbounded count
@@ -208,6 +210,12 @@ void ExtractUnderlines(NSAttributedString* string,
     BOOL automaticQuoteSubstitutionEnabled;
 @property(getter=isAutomaticDashSubstitutionEnabled)
     BOOL automaticDashSubstitutionEnabled;
+@property(getter=isAutomaticSpellingCorrectionEnabled)
+    BOOL automaticSpellingCorrectionEnabled;
+
+// This view's session identity with the spell checker, allocated on first
+// use.
+@property(readonly) NSInteger spellDocumentTag;
 
 // Tracks the window for which the "onWindowDidResignKey" notification was
 // deferred.
@@ -405,6 +413,7 @@ gfx::PointF GetSanitizedFlippedPoint(NSPoint point, CGFloat height) {
 
   NSCandidateListTouchBarItem* __strong _candidateListTouchBarItem;
   NSInteger _textSuggestionsSequenceNumber;
+  NSInteger _spellDocumentTag;
   NSTextCheckingResult* __strong _pendingSubstitution;
   NSString* __strong _pendingSubstitutionOriginal;
   NSTextCheckingResult* __strong _shownSubstitution;
@@ -455,6 +464,8 @@ static NSWindow* __weak _deferredResignKeyWindow;
 - (void)dealloc {
   DCHECK([self hostIsDisconnected]);
   [[NSNotificationCenter defaultCenter] removeObserver:self];
+  if (_spellDocumentTag)
+    [self.spellChecker closeSpellDocumentWithTag:_spellDocumentTag];
 
   // Update and cache the new input context. Otherwise,
   // [NSTextInputContext currentInputContext] might still hold on to this
@@ -490,11 +501,26 @@ static NSWindow* __weak _deferredResignKeyWindow;
   return NSSpellChecker.sharedSpellChecker;
 }
 
+- (NSInteger)spellDocumentTag {
+  if (!_spellDocumentTag)
+    _spellDocumentTag = [NSSpellChecker uniqueSpellDocumentTag];
+  return _spellDocumentTag;
+}
+
 - (void)requestTextSubstitutions {
   NSTextCheckingType textCheckingTypes =
       self.allowedTextCheckingTypes & self.enabledTextCheckingTypes;
   if (!textCheckingTypes)
     return;
+
+  // The checker generates correction results only when spelling checking is
+  // part of the same request. Spelling and orthography results are markers
+  // with no replacement string, skipped below.
+  NSTextCheckingType requestedTypes = textCheckingTypes;
+  if (requestedTypes & NSTextCheckingTypeCorrection) {
+    requestedTypes |=
+        NSTextCheckingTypeSpelling | NSTextCheckingTypeOrthography;
+  }
 
   NSString* availableText = base::SysUTF16ToNSString(_availableText);
 
@@ -504,9 +530,9 @@ static NSWindow* __weak _deferredResignKeyWindow;
   auto* textCheckingResults =
       [self.spellChecker checkString:availableText
                                range:NSMakeRange(0, availableText.length)
-                               types:textCheckingTypes
+                               types:requestedTypes
                              options:nil
-              inSpellDocumentWithTag:0
+              inSpellDocumentWithTag:self.spellDocumentTag
                          orthography:nullptr
                            wordCount:nullptr];
 
@@ -521,6 +547,8 @@ static NSWindow* __weak _deferredResignKeyWindow;
   for (NSTextCheckingResult* result in textCheckingResults) {
     NSTextCheckingResult* adjustedResult =
         [result resultByAdjustingRangesWithOffset:_availableTextOffset];
+    if (!adjustedResult.replacementString)
+      continue;
     BOOL touchesCursor = NSLocationInRange(
         cursorLocation, NSMakeRange(adjustedResult.range.location,
                                     adjustedResult.range.length + 1));
@@ -854,13 +882,12 @@ static NSWindow* __weak _deferredResignKeyWindow;
     return;
   }
 
-  // TODO: Fetch the spell document tag from the renderer (or equivalent).
   _textSuggestionsSequenceNumber = [self.spellChecker
       requestCandidatesForSelectedRange:selectionRange
                                inString:selectionText
                                   types:NSTextCheckingAllSystemTypes
                                 options:nil
-                 inSpellDocumentWithTag:0
+                 inSpellDocumentWithTag:self.spellDocumentTag
                       completionHandler:^(
                           NSInteger sequenceNumber,
                           NSArray<NSTextCheckingResult*>* candidates) {
@@ -889,6 +916,20 @@ static NSWindow* __weak _deferredResignKeyWindow;
   NSTextCheckingType checkingTypes = NSTextCheckingTypeReplacement;
   if (!(_textInputFlags & ui::TEXT_INPUT_FLAG_SPELLCHECK_OFF)) {
     checkingTypes |= NSTextCheckingTypeQuote | NSTextCheckingTypeDash;
+    // Correction is a spelling operation, so spellcheck="false" disables it.
+    // It is also withheld from fields holding addresses, URLs and phone
+    // numbers, which are not prose: the HTML autocorrection specification
+    // resolves the used autocorrect state to off for email and URL fields,
+    // and telephone is excluded on the same reasoning.
+    // https://html.spec.whatwg.org/multipage/interaction.html#autocorrection
+    BOOL isNonProseField = _textInputType == ui::TEXT_INPUT_TYPE_EMAIL ||
+                           _textInputType == ui::TEXT_INPUT_TYPE_URL ||
+                           _textInputType == ui::TEXT_INPUT_TYPE_TELEPHONE;
+    if (base::FeatureList::IsEnabled(
+            features::kMacAutomaticSpellingCorrection) &&
+        !isNonProseField) {
+      checkingTypes |= NSTextCheckingTypeCorrection;
+    }
   }
   return checkingTypes;
 }
@@ -903,6 +944,9 @@ static NSWindow* __weak _deferredResignKeyWindow;
   }
   if (self.automaticTextReplacementEnabled) {
     checkingTypes |= NSTextCheckingTypeReplacement;
+  }
+  if (self.automaticSpellingCorrectionEnabled) {
+    checkingTypes |= NSTextCheckingTypeCorrection;
   }
   return checkingTypes;
 }
@@ -2396,6 +2440,26 @@ static NSWindow* __weak _deferredResignKeyWindow;
   self.automaticTextReplacementEnabled = !self.automaticTextReplacementEnabled;
 }
 
+- (BOOL)isAutomaticSpellingCorrectionEnabled {
+  if (![NSUserDefaults.standardUserDefaults
+          objectForKey:WebAutomaticSpellingCorrectionEnabled]) {
+    return NSSpellChecker.automaticSpellingCorrectionEnabled;
+  }
+  return [NSUserDefaults.standardUserDefaults
+      boolForKey:WebAutomaticSpellingCorrectionEnabled];
+}
+
+- (void)setAutomaticSpellingCorrectionEnabled:(BOOL)enabled {
+  [NSUserDefaults.standardUserDefaults
+      setBool:enabled
+       forKey:WebAutomaticSpellingCorrectionEnabled];
+}
+
+- (void)toggleAutomaticSpellingCorrection:(id)sender {
+  self.automaticSpellingCorrectionEnabled =
+      !self.automaticSpellingCorrectionEnabled;
+}
+
 - (BOOL)validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item {
   if (item.action == @selector(orderFrontSubstitutionsPanel:))
     return YES;
@@ -2409,6 +2473,9 @@ static NSWindow* __weak _deferredResignKeyWindow;
     } else if (item.action == @selector(toggleAutomaticTextReplacement:)) {
       menuItem.state = self.automaticTextReplacementEnabled;
       return !!(self.allowedTextCheckingTypes & NSTextCheckingTypeReplacement);
+    } else if (item.action == @selector(toggleAutomaticSpellingCorrection:)) {
+      menuItem.state = self.automaticSpellingCorrectionEnabled;
+      return !!(self.allowedTextCheckingTypes & NSTextCheckingTypeCorrection);
     } else if (item.action == @selector(uppercaseWord:)) {
       return self.canTransformText;
     } else if (item.action == @selector(lowercaseWord:)) {

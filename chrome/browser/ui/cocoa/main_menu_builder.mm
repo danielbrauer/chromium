@@ -259,6 +259,9 @@ NSMenuItem* BuildEditMenu(NSApplication* nsapp,
                                   (toggleContinuousSpellChecking:)),
                       Item(IDS_EDIT_CHECK_GRAMMAR_MAC)
                           .action(@selector(toggleGrammarChecking:)),
+                      Item(IDS_EDIT_CORRECT_SPELLING_AUTOMATICALLY_MAC)
+                          .action(@selector
+                                  (toggleAutomaticSpellingCorrection:)),
                   }),
               Item(IDS_EDIT_SUBSTITUTIONS_MAC)
                   .submenu({

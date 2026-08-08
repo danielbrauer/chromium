@@ -149,6 +149,12 @@ BASE_FEATURE(kCachedFirstRectAllowInvalidSelection,
 BASE_FEATURE(kCancelCompositionWhenWindowLosesFocus,
              base::FEATURE_ENABLED_BY_DEFAULT);
 
+// When enabled, macOS text substitutions include automatic spelling
+// correction, gated on the system's "Correct spelling automatically"
+// setting.
+BASE_FEATURE(kMacAutomaticSpellingCorrection,
+             base::FEATURE_DISABLED_BY_DEFAULT);
+
 // Kill switch for arbitrating macOS substitution acceptance by text state:
 // enabled, an indicator resolution caused by a key event defers to the text
 // arbitration, and a held offer applies silently when the user's keystroke

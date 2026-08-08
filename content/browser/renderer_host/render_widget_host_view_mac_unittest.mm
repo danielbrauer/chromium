@@ -176,6 +176,8 @@ using SpellCheckerCompletionHandlerType = void (
 @property(readonly) NSInteger lastAssignedSequenceNumber;
 @property(readonly) NSDictionary<NSNumber*, SpellCheckerCompletionHandlerType>*
     completionHandlers;
+@property(readonly) NSTextCheckingTypes lastRequestedCheckingTypes;
+@property(readonly) NSInteger lastSpellDocumentTag;
 @property(readonly) NSCorrectionIndicatorType shownIndicatorType;
 @property(readonly) NSString* shownPrimaryString;
 @property(readonly) NSUInteger indicatorShowCount;
@@ -188,6 +190,8 @@ using SpellCheckerCompletionHandlerType = void (
 
 @synthesize lastAssignedSequenceNumber = _lastAssignedSequenceNumber;
 @synthesize completionHandlers = _completionHandlers;
+@synthesize lastRequestedCheckingTypes = _lastRequestedCheckingTypes;
+@synthesize lastSpellDocumentTag = _lastSpellDocumentTag;
 @synthesize shownIndicatorType = _shownIndicatorType;
 @synthesize shownPrimaryString = _shownPrimaryString;
 @synthesize indicatorShowCount = _indicatorShowCount;
@@ -225,8 +229,18 @@ using SpellCheckerCompletionHandlerType = void (
   return NO;
 }
 
-// A Text Replacement offer for "omw", the substitution type the substitution
-// tests below exercise.
+- (NSString*)language {
+  return @"en";
+}
+
+// A Text Replacement offer for "omw", plus the real checker's contract for
+// corrections: the unified checker generates correction results only when
+// spelling checking is requested in the same call. (It also requires genuine
+// interactive typing in the process, which no test can synthesize; the fake
+// stands in for a checker that is being typed into.) A spelling result
+// accompanies each correction, and a misspelling with no available
+// correction produces a spelling result alone — both are markers with no
+// replacementString that the caller must skip.
 - (NSArray<NSTextCheckingResult*>*)
                checkString:(NSString*)stringToCheck
                      range:(NSRange)range
@@ -236,6 +250,8 @@ using SpellCheckerCompletionHandlerType = void (
     inSpellDocumentWithTag:(NSInteger)tag
                orthography:(NSOrthography**)orthography
                  wordCount:(NSInteger*)wordCount {
+  _lastRequestedCheckingTypes = checkingTypes;
+  _lastSpellDocumentTag = tag;
   NSMutableArray<NSTextCheckingResult*>* results = [NSMutableArray array];
   NSRange replaceableRange = [stringToCheck rangeOfString:@"omw"];
   if (replaceableRange.location != NSNotFound &&
@@ -244,7 +260,27 @@ using SpellCheckerCompletionHandlerType = void (
                            replacementCheckingResultWithRange:replaceableRange
                                             replacementString:@"On my way!"]];
   }
+  if (!(checkingTypes & NSTextCheckingTypeSpelling))
+    return results;
+  NSRange misspelledRange = [stringToCheck rangeOfString:@"zzz"];
+  if (misspelledRange.location != NSNotFound) {
+    [results addObject:[NSTextCheckingResult
+                           spellCheckingResultWithRange:misspelledRange]];
+  }
+  NSRange correctableRange = [stringToCheck rangeOfString:@"teh"];
+  if (correctableRange.location != NSNotFound &&
+      (checkingTypes & NSTextCheckingTypeCorrection)) {
+    [results addObject:[NSTextCheckingResult
+                           spellCheckingResultWithRange:correctableRange]];
+    [results
+        addObject:[NSTextCheckingResult
+                      correctionCheckingResultWithRange:correctableRange
+                                      replacementString:@"the"]];
+  }
   return results;
+}
+
+- (void)closeSpellDocumentWithTag:(NSInteger)tag {
 }
 
 - (void)showCorrectionIndicatorOfType:(NSCorrectionIndicatorType)type
@@ -268,6 +304,7 @@ using SpellCheckerCompletionHandlerType = void (
 // reached through the FakeSpellChecker's captured
 // `correctionCompletionHandler` rather than by direct invocation.)
 @interface RenderWidgetHostViewCocoa (TextSubstitutionsTesting)
+- (NSTextCheckingType)allowedTextCheckingTypes;
 - (void)requestTextSubstitutions;
 - (void)showPendingSubstitutionIndicatorNow;
 @end
@@ -304,6 +341,39 @@ class ScopedAutomaticTextReplacementOverride {
     } else {
       [NSUserDefaults.standardUserDefaults
           removeObjectForKey:kWebAutomaticTextReplacementEnabled];
+    }
+  }
+
+ private:
+  id __strong previous_;
+};
+
+NSString* const kWebAutomaticSpellingCorrectionEnabled =
+    @"WebAutomaticSpellingCorrectionEnabled";
+
+class ScopedAutomaticSpellingCorrectionOverride {
+ public:
+  explicit ScopedAutomaticSpellingCorrectionOverride(bool enabled) {
+    previous_ = [NSUserDefaults.standardUserDefaults
+        objectForKey:kWebAutomaticSpellingCorrectionEnabled];
+    [NSUserDefaults.standardUserDefaults
+        setBool:enabled
+         forKey:kWebAutomaticSpellingCorrectionEnabled];
+  }
+
+  ScopedAutomaticSpellingCorrectionOverride(
+      const ScopedAutomaticSpellingCorrectionOverride&) = delete;
+  ScopedAutomaticSpellingCorrectionOverride& operator=(
+      const ScopedAutomaticSpellingCorrectionOverride&) = delete;
+
+  ~ScopedAutomaticSpellingCorrectionOverride() {
+    if (previous_) {
+      [NSUserDefaults.standardUserDefaults
+          setObject:previous_
+             forKey:kWebAutomaticSpellingCorrectionEnabled];
+    } else {
+      [NSUserDefaults.standardUserDefaults
+          removeObjectForKey:kWebAutomaticSpellingCorrectionEnabled];
     }
   }
 
@@ -2630,6 +2700,19 @@ class TextSubstitutionTest : public InputMethodMacTest {
   FakeSpellChecker* __strong spell_checker_;
 };
 
+// The same harness with automatic spelling correction enabled.
+class SpellingCorrectionTest : public TextSubstitutionTest {
+ public:
+  SpellingCorrectionTest() {
+    feature_list_.InitAndEnableFeature(
+        features::kMacAutomaticSpellingCorrection);
+  }
+
+ protected:
+  base::test::ScopedFeatureList feature_list_;
+  ScopedAutomaticSpellingCorrectionOverride correction_enabled_{true};
+};
+
 // The tests below cover the text substitutions offer/accept path. A
 // substitution candidate is computed against the available text window as it
 // stood when a check ran, but it is applied later — when the user's own
@@ -2943,6 +3026,237 @@ TEST_F(TextSubstitutionTest, TextSubstitutionOfferedWhenUpdatesLagTyping) {
                                    gfx::Range(0, 3), 0, 0,
                                    blink::mojom::ImeState::kNone,
                                    blink::DOMNodeIdType()));
+}
+
+// -allowedTextCheckingTypes decides which substitutions may be requested for
+// the focused element. The tests below pin each of its guards against the
+// correction type, which is the one that is both new and gated on the most
+// conditions.
+
+// Fields holding addresses, URLs and phone numbers are not prose: the HTML
+// autocorrection specification resolves the used autocorrect state to off
+// for email and URL fields, and telephone is excluded on the same
+// reasoning. Only correction is masked; the shipped substitution types are
+// unaffected.
+TEST_F(InputMethodMacTest, AllowedTextCheckingTypesForNonProseFields) {
+  base::test::ScopedFeatureList feature_list;
+  feature_list.InitAndEnableFeature(features::kMacAutomaticSpellingCorrection);
+
+  for (auto type : {ui::TEXT_INPUT_TYPE_EMAIL, ui::TEXT_INPUT_TYPE_URL,
+                    ui::TEXT_INPUT_TYPE_TELEPHONE}) {
+    SetTextInputType(tab_view(), type);
+    NSTextCheckingType types =
+        tab_GetInProcessNSView().allowedTextCheckingTypes;
+    EXPECT_FALSE(types & NSTextCheckingTypeCorrection);
+    EXPECT_TRUE(types & NSTextCheckingTypeReplacement);
+  }
+}
+
+TEST_F(InputMethodMacTest, AllowedTextCheckingTypesIncludesCorrection) {
+  base::test::ScopedFeatureList feature_list;
+  feature_list.InitAndEnableFeature(features::kMacAutomaticSpellingCorrection);
+
+  SetTextInputType(tab_view(), ui::TEXT_INPUT_TYPE_TEXT);
+
+  EXPECT_TRUE(tab_GetInProcessNSView().allowedTextCheckingTypes &
+              NSTextCheckingTypeCorrection);
+}
+
+TEST_F(InputMethodMacTest, AllowedTextCheckingTypesWithoutFeature) {
+  base::test::ScopedFeatureList feature_list;
+  feature_list.InitAndDisableFeature(features::kMacAutomaticSpellingCorrection);
+
+  SetTextInputType(tab_view(), ui::TEXT_INPUT_TYPE_TEXT);
+
+  NSTextCheckingType types = tab_GetInProcessNSView().allowedTextCheckingTypes;
+  EXPECT_FALSE(types & NSTextCheckingTypeCorrection);
+  EXPECT_TRUE(types & NSTextCheckingTypeReplacement);
+}
+
+// Correction is a spelling operation, so spellcheck="false" disables it. Text
+// replacement is not, and stays available.
+TEST_F(InputMethodMacTest, AllowedTextCheckingTypesRespectsSpellcheckOff) {
+  base::test::ScopedFeatureList feature_list;
+  feature_list.InitAndEnableFeature(features::kMacAutomaticSpellingCorrection);
+
+  SetTextInputType(tab_view(), ui::TEXT_INPUT_TYPE_TEXT,
+                   ui::TEXT_INPUT_FLAG_SPELLCHECK_OFF);
+
+  NSTextCheckingType types = tab_GetInProcessNSView().allowedTextCheckingTypes;
+  EXPECT_FALSE(types & NSTextCheckingTypeCorrection);
+  EXPECT_TRUE(types & NSTextCheckingTypeReplacement);
+}
+
+TEST_F(InputMethodMacTest, AllowedTextCheckingTypesRespectsAutocorrectOff) {
+  base::test::ScopedFeatureList feature_list;
+  feature_list.InitAndEnableFeature(features::kMacAutomaticSpellingCorrection);
+
+  SetTextInputType(tab_view(), ui::TEXT_INPUT_TYPE_TEXT,
+                   ui::TEXT_INPUT_FLAG_AUTOCORRECT_OFF);
+
+  EXPECT_EQ(0, tab_GetInProcessNSView().allowedTextCheckingTypes);
+}
+
+// End-to-end within the browser process: typing a misspelled word offers a
+// correction through the AppKit indicator, and accepting it replaces the word.
+TEST_F(SpellingCorrectionTest, CorrectionOfferedAndApplied) {
+  // The user has typed "teh", with the insertion point after it.
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+
+  // Correction requires the spelling and orthography types alongside it, and
+  // a real spell document tag, or the checker will not generate corrections.
+  EXPECT_TRUE(spell_checker_.lastRequestedCheckingTypes &
+              NSTextCheckingTypeCorrection);
+  EXPECT_TRUE(spell_checker_.lastRequestedCheckingTypes &
+              NSTextCheckingTypeSpelling);
+  EXPECT_TRUE(spell_checker_.lastRequestedCheckingTypes &
+              NSTextCheckingTypeOrthography);
+  EXPECT_NE(0, spell_checker_.lastSpellDocumentTag);
+  EXPECT_NSEQ(@"the", spell_checker_.shownPrimaryString);
+  EXPECT_EQ(NSCorrectionIndicatorTypeDefault, spell_checker_.shownIndicatorType);
+  ASSERT_TRUE(spell_checker_.correctionCompletionHandler);
+
+  // AppKit reports that the user accepted the correction.
+  spell_checker_.correctionCompletionHandler(@"the");
+  base::RunLoop().RunUntilIdle();
+
+  MockWidgetInputHandler::MessageVector events =
+      host_->GetAndResetDispatchedMessages();
+  EXPECT_EQ("CommitText", GetMessageNames(events));
+}
+
+// The spell checker is asked about a range within the available text, but the
+// correction it produces has to come back in document coordinates, since that
+// is what the accept path and -firstRectForCharacterRange: expect. When the
+// available text window does not start at the beginning of the document those
+// two differ, and getting the conversion wrong sends the correction at a range
+// the accept path rejects.
+TEST_F(SpellingCorrectionTest, CorrectionRangeIsInDocumentCoordinates) {
+  // "teh" occupies document range [100, 103), and the window it arrives in
+  // starts at 100. The insertion point is at the end of the word.
+  constexpr size_t kOffset = 100;
+  tab_view()->SelectionChanged(u"teh", kOffset, gfx::Range(103, 103));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+
+  // The checker sees the word at its position within the window...
+  ASSERT_TRUE(spell_checker_.correctionCompletionHandler);
+
+  spell_checker_.correctionCompletionHandler(@"the");
+  base::RunLoop().RunUntilIdle();
+
+  // ...but the correction is applied at its position in the document. Had it
+  // been left in window coordinates, the accept path's lower bound check would
+  // have discarded it and nothing would have been committed.
+  MockWidgetInputHandler::MessageVector events =
+      host_->GetAndResetDispatchedMessages();
+  ASSERT_EQ("CommitText", GetMessageNames(events));
+  MockWidgetInputHandler::DispatchedIMEMessage* ime_message =
+      events[0]->ToIME();
+  ASSERT_TRUE(ime_message);
+  EXPECT_TRUE(ime_message->Matches(u"the", std::vector<ui::ImeTextSpan>(),
+                                   gfx::Range(100, 103), 0, 0,
+                                   blink::mojom::ImeState::kNone,
+                                   blink::DOMNodeIdType()));
+}
+
+// A correction for a word the insertion point is not in or adjacent to is not
+// offered — the same locality rule the other substitution types follow.
+TEST_F(SpellingCorrectionTest, CorrectionNotOfferedAwayFromCursor) {
+  // "teh" sits at the start; the insertion point is off in the next word.
+  tab_view()->SelectionChanged(u"teh and more", 0, gfx::Range(8, 8));
+  base::RunLoop().RunUntilIdle();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+
+  EXPECT_FALSE(spell_checker_.correctionCompletionHandler);
+}
+
+// A misspelling the checker has no correction for arrives as a spelling
+// result, a marker with no replacement string. It must be skipped, not
+// offered as if it were a substitution.
+TEST_F(SpellingCorrectionTest, SpellingMarkerWithoutCorrectionIsNotOffered) {
+  tab_view()->SelectionChanged(u"zzz", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+
+  EXPECT_FALSE(spell_checker_.correctionCompletionHandler);
+  EXPECT_FALSE(spell_checker_.shownPrimaryString);
+}
+
+// Without the system setting (or its per-app override) no correction is
+// requested, even with the feature enabled.
+TEST_F(SpellingCorrectionTest, CorrectionNotOfferedWhenSettingIsOff) {
+  ScopedAutomaticSpellingCorrectionOverride correction_disabled(false);
+
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+
+  EXPECT_FALSE(spell_checker_.lastRequestedCheckingTypes &
+               NSTextCheckingTypeCorrection);
+  EXPECT_FALSE(spell_checker_.lastRequestedCheckingTypes &
+               NSTextCheckingTypeSpelling);
+  EXPECT_FALSE(spell_checker_.correctionCompletionHandler);
+}
+
+// Correction is a spelling operation, so spellcheck="false" suppresses it.
+TEST_F(SpellingCorrectionTest, CorrectionNotOfferedWhenSpellcheckIsOff) {
+  SetTextInputType(tab_view(), ui::TEXT_INPUT_TYPE_TEXT,
+                   ui::TEXT_INPUT_FLAG_SPELLCHECK_OFF);
+
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+
+  EXPECT_FALSE(spell_checker_.lastRequestedCheckingTypes &
+               NSTextCheckingTypeCorrection);
+  EXPECT_FALSE(spell_checker_.lastRequestedCheckingTypes &
+               NSTextCheckingTypeSpelling);
+  EXPECT_FALSE(spell_checker_.correctionCompletionHandler);
+}
+
+// Without the feature the correction lookup does not happen at all.
+TEST_F(TextSubstitutionTest, CorrectionNotOfferedWithoutFeature) {
+  base::test::ScopedFeatureList feature_list;
+  feature_list.InitAndDisableFeature(features::kMacAutomaticSpellingCorrection);
+  ScopedAutomaticSpellingCorrectionOverride correction_enabled(true);
+
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+
+  EXPECT_FALSE(spell_checker_.lastRequestedCheckingTypes &
+               NSTextCheckingTypeCorrection);
+  EXPECT_FALSE(spell_checker_.lastRequestedCheckingTypes &
+               NSTextCheckingTypeSpelling);
+  EXPECT_FALSE(spell_checker_.correctionCompletionHandler);
+}
+
+TEST_F(InputMethodMacTest, AllowedTextCheckingTypesForPasswordFields) {
+  base::test::ScopedFeatureList feature_list;
+  feature_list.InitAndEnableFeature(features::kMacAutomaticSpellingCorrection);
+
+  SetTextInputType(tab_view(), ui::TEXT_INPUT_TYPE_PASSWORD);
+
+  EXPECT_EQ(0, tab_GetInProcessNSView().allowedTextCheckingTypes);
 }
 
 // This test verifies that in AutoResize mode a child-allocated

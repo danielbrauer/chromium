@@ -15787,6 +15787,9 @@ Please help our engineers fix this problem. Tell us what happened right before y
         <message name="IDS_EDIT_CHECK_GRAMMAR_MAC" desc="In Title Case: The Mac menu item for check grammar with spelling in the edit menu.">
           Check Grammar With Spelling
         </message>
+        <message name="IDS_EDIT_CORRECT_SPELLING_AUTOMATICALLY_MAC" desc="In Title Case: The Mac menu item for toggling automatic spelling correction in the edit menu.">
+          Correct Spelling Automatically
+        </message>
         <!-- Edit::Substitutions submenu -->
         <message name="IDS_EDIT_SUBSTITUTIONS_MAC" desc="In Title Case: The Mac menu item for the substitutions submenu in the edit menu.">
           Substitutions

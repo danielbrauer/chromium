@@ -174,6 +174,9 @@
   self.acceptedString = primaryString;
 }
 
+- (void)closeSpellDocumentWithTag:(NSInteger)tag {
+}
+
 - (void)dismissCorrectionIndicatorForView:(NSView*)view {
   // Call the completion handler with the accepted string when dismissed
   if (self.correctionCompletionHandler) {
