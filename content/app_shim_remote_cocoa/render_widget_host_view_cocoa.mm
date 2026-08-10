@@ -83,6 +83,11 @@ constexpr NSString* const WebAutomaticDashSubstitutionEnabled =
 constexpr NSString* const WebAutomaticTextReplacementEnabled =
     @"WebAutomaticTextReplacementEnabled";
 
+// Cap on typed insertions still owing a substitution check, in case their
+// text updates never arrive; a stale check is harmless, an unbounded count
+// is not.
+constexpr NSUInteger kMaxPendingTextSubstitutionChecks = 16;
+
 constexpr NSString* const kGoogleJapaneseInputPrefix =
     @"com.google.inputmethod.Japanese.";
 
@@ -401,7 +406,7 @@ gfx::PointF GetSanitizedFlippedPoint(NSPoint point, CGFloat height) {
 
   NSCandidateListTouchBarItem* __strong _candidateListTouchBarItem;
   NSInteger _textSuggestionsSequenceNumber;
-  BOOL _shouldRequestTextSubstitutions;
+  NSUInteger _pendingTextSubstitutionChecks;
   BOOL _substitutionWasApplied;
   bool _sonomaAccessibilityRefinementsAreActive;
   std::unique_ptr<content::ScopedAccessibilityMode> _basic_accessibility_mode;
@@ -771,9 +776,9 @@ static NSWindow* __weak _deferredResignKeyWindow;
   _textSelectionRange = range;
   _substitutionWasApplied = NO;
   [self.spellChecker dismissCorrectionIndicatorForView:self];
-  if (_shouldRequestTextSubstitutions && !_substitutionWasApplied &&
+  if (_pendingTextSubstitutionChecks > 0 && !_substitutionWasApplied &&
       _textSelectionRange.is_empty()) {
-    _shouldRequestTextSubstitutions = NO;
+    _pendingTextSubstitutionChecks--;
     [self requestTextSubstitutions];
   }
   [self requestTextSuggestions];
@@ -2764,7 +2769,13 @@ extern NSString* NSTextInputReplacementRangeAttributeName;
     // being processed in |keyEvent:|. The commit will happen later after
     // |interpretKeyEvents:| returns.
     _textToBeInserted.append(base::SysNSStringToUTF16(imText));
-    _shouldRequestTextSubstitutions = YES;
+    // Each typed insertion owes one substitution check when its text update
+    // arrives. A one-shot flag would be consumed by the first update when the
+    // renderer lags behind typing, losing the check for the update that
+    // completes the word.
+    if (_pendingTextSubstitutionChecks < kMaxPendingTextSubstitutionChecks) {
+      _pendingTextSubstitutionChecks++;
+    }
   } else {
     // Fix the issue that Apple intelligence's writing tools not working. The
     // writing tools bubble will grab the focus from browser after the user

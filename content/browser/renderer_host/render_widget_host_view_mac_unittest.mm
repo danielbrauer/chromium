@@ -176,6 +176,10 @@ using SpellCheckerCompletionHandlerType = void (
 @property(readonly) NSInteger lastAssignedSequenceNumber;
 @property(readonly) NSDictionary<NSNumber*, SpellCheckerCompletionHandlerType>*
     completionHandlers;
+@property(readonly) NSCorrectionIndicatorType shownIndicatorType;
+@property(readonly) NSString* shownPrimaryString;
+@property(readonly) NSUInteger indicatorShowCount;
+@property(readonly) void (^correctionCompletionHandler)(NSString*);
 @end
 
 @implementation FakeSpellChecker {
@@ -184,6 +188,10 @@ using SpellCheckerCompletionHandlerType = void (
 
 @synthesize lastAssignedSequenceNumber = _lastAssignedSequenceNumber;
 @synthesize completionHandlers = _completionHandlers;
+@synthesize shownIndicatorType = _shownIndicatorType;
+@synthesize shownPrimaryString = _shownPrimaryString;
+@synthesize indicatorShowCount = _indicatorShowCount;
+@synthesize correctionCompletionHandler = _correctionCompletionHandler;
 
 - (instancetype)init {
   if (self = [super init]) {
@@ -217,6 +225,40 @@ using SpellCheckerCompletionHandlerType = void (
   return NO;
 }
 
+// A Text Replacement offer for "omw", the substitution type the substitution
+// tests below exercise.
+- (NSArray<NSTextCheckingResult*>*)
+               checkString:(NSString*)stringToCheck
+                     range:(NSRange)range
+                     types:(NSTextCheckingTypes)checkingTypes
+                   options:(nullable NSDictionary<NSTextCheckingOptionKey, id>*)
+                               options
+    inSpellDocumentWithTag:(NSInteger)tag
+               orthography:(NSOrthography**)orthography
+                 wordCount:(NSInteger*)wordCount {
+  NSMutableArray<NSTextCheckingResult*>* results = [NSMutableArray array];
+  NSRange replaceableRange = [stringToCheck rangeOfString:@"omw"];
+  if (replaceableRange.location != NSNotFound &&
+      (checkingTypes & NSTextCheckingTypeReplacement)) {
+    [results addObject:[NSTextCheckingResult
+                           replacementCheckingResultWithRange:replaceableRange
+                                            replacementString:@"On my way!"]];
+  }
+  return results;
+}
+
+- (void)showCorrectionIndicatorOfType:(NSCorrectionIndicatorType)type
+                        primaryString:(NSString*)primaryString
+                   alternativeStrings:(NSArray<NSString*>*)alternativeStrings
+                      forStringInRect:(NSRect)rect
+                                 view:(NSView*)view
+                    completionHandler:(void (^)(NSString*))completionHandler {
+  _shownIndicatorType = type;
+  _shownPrimaryString = primaryString;
+  _indicatorShowCount++;
+  _correctionCompletionHandler = completionHandler;
+}
+
 @end
 
 // -didAcceptReplacementString:… is private to RenderWidgetHostViewCocoa. The
@@ -228,6 +270,47 @@ using SpellCheckerCompletionHandlerType = void (
              forTextCheckingResult:(NSTextCheckingResult*)correction
                   withChangeNumber:(NSUInteger)changeNumber;
 @end
+
+namespace {
+
+// The per-app override RenderWidgetHostViewCocoa consults before the
+// NSSpellChecker class property, which -spellCheckerForTesting cannot
+// intercept. Without it these tests would depend on the machine's system
+// settings.
+NSString* const kWebAutomaticTextReplacementEnabled =
+    @"WebAutomaticTextReplacementEnabled";
+
+class ScopedAutomaticTextReplacementOverride {
+ public:
+  explicit ScopedAutomaticTextReplacementOverride(bool enabled) {
+    previous_ = [NSUserDefaults.standardUserDefaults
+        objectForKey:kWebAutomaticTextReplacementEnabled];
+    [NSUserDefaults.standardUserDefaults
+        setBool:enabled
+         forKey:kWebAutomaticTextReplacementEnabled];
+  }
+
+  ScopedAutomaticTextReplacementOverride(
+      const ScopedAutomaticTextReplacementOverride&) = delete;
+  ScopedAutomaticTextReplacementOverride& operator=(
+      const ScopedAutomaticTextReplacementOverride&) = delete;
+
+  ~ScopedAutomaticTextReplacementOverride() {
+    if (previous_) {
+      [NSUserDefaults.standardUserDefaults
+          setObject:previous_
+             forKey:kWebAutomaticTextReplacementEnabled];
+    } else {
+      [NSUserDefaults.standardUserDefaults
+          removeObjectForKey:kWebAutomaticTextReplacementEnabled];
+    }
+  }
+
+ private:
+  id __strong previous_;
+};
+
+}  // namespace
 
 namespace content {
 
@@ -2582,6 +2665,63 @@ TEST_F(InputMethodMacTest, TextSubstitutionIgnoredWhenExtendingPastWindow) {
   MockWidgetInputHandler::MessageVector events =
       host_->GetAndResetDispatchedMessages();
   EXPECT_EQ("", GetMessageNames(events));
+}
+
+// Regression test: when the renderer's text updates lag behind typing, the
+// browser processes every keystroke of a burst before the first update
+// arrives. Substitution checks must stay one-to-one with keystrokes — with a
+// one-shot flag, the first (premature) update consumes it, the update that
+// completes the word runs no check, and the substitution is silently lost.
+TEST_F(InputMethodMacTest, TextSubstitutionOfferedWhenUpdatesLagTyping) {
+  ScopedAutomaticTextReplacementOverride replacement_enabled(true);
+  FakeSpellChecker* spellChecker = [[FakeSpellChecker alloc] init];
+  tab_GetInProcessNSView().spellCheckerForTesting =
+      static_cast<NSSpellChecker*>(spellChecker);
+  SetTextInputType(tab_view(), ui::TEXT_INPUT_TYPE_TEXT);
+
+  // The user types "omw " in one fast burst: all four key events are
+  // processed before any renderer update arrives.
+  [tab_GetInProcessNSView()
+      keyEvent:cocoa_test_event_utils::KeyEventWithKeyCode(
+                   0x1F, 'o', NSEventTypeKeyDown, 0)];
+  [tab_GetInProcessNSView()
+      keyEvent:cocoa_test_event_utils::KeyEventWithKeyCode(
+                   0x2E, 'm', NSEventTypeKeyDown, 0)];
+  [tab_GetInProcessNSView()
+      keyEvent:cocoa_test_event_utils::KeyEventWithKeyCode(
+                   0x0D, 'w', NSEventTypeKeyDown, 0)];
+  [tab_GetInProcessNSView()
+      keyEvent:cocoa_test_event_utils::KeyEventWithKeyCode(
+                   0x31, ' ', NSEventTypeKeyDown, 0)];
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  // The renderer's updates then arrive serialized, one per keystroke. The
+  // check that runs when the word is complete must offer the substitution.
+  tab_view()->SelectionChanged(u"o", 0, gfx::Range(1, 1));
+  tab_view()->SelectionChanged(u"om", 0, gfx::Range(2, 2));
+  tab_view()->SelectionChanged(u"omw", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+  EXPECT_EQ(1u, spellChecker.indicatorShowCount);
+  ASSERT_TRUE(spellChecker.correctionCompletionHandler);
+
+  // AppKit reports that the user accepted the offer; the substitution
+  // applies at its range.
+  spellChecker.correctionCompletionHandler(@"On my way!");
+  base::RunLoop().RunUntilIdle();
+
+  MockWidgetInputHandler::MessageVector events =
+      host_->GetAndResetDispatchedMessages();
+  ASSERT_EQ("CommitText", GetMessageNames(events));
+  MockWidgetInputHandler::DispatchedIMEMessage* ime_message =
+      events[0]->ToIME();
+  ASSERT_TRUE(ime_message);
+  EXPECT_TRUE(ime_message->Matches(u"On my way!",
+                                   std::vector<ui::ImeTextSpan>(),
+                                   gfx::Range(0, 3), 0, 0,
+                                   blink::mojom::ImeState::kNone,
+                                   blink::DOMNodeIdType()));
 }
 
 // This test verifies that in AutoResize mode a child-allocated
