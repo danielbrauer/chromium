@@ -261,14 +261,15 @@ using SpellCheckerCompletionHandlerType = void (
 
 @end
 
-// -didAcceptReplacementString:… is private to RenderWidgetHostViewCocoa. The
-// text substitution tests below drive it directly: AppKit decides when to
-// invoke it, so there is no way to reach it from a unit test through the
-// public interface.
+// These methods are private to RenderWidgetHostViewCocoa. The text
+// substitution tests below drive them directly: AppKit and the renderer
+// decide when to invoke them, so there is no way to reach them from a unit
+// test through the public interface. (The indicator's completion handler is
+// reached through the FakeSpellChecker's captured
+// `correctionCompletionHandler` rather than by direct invocation.)
 @interface RenderWidgetHostViewCocoa (TextSubstitutionsTesting)
-- (void)didAcceptReplacementString:(NSString*)acceptedString
-             forTextCheckingResult:(NSTextCheckingResult*)correction
-                  withChangeNumber:(NSUInteger)changeNumber;
+- (void)requestTextSubstitutions;
+- (void)showPendingSubstitutionIndicatorNow;
 @end
 
 namespace {
@@ -2568,103 +2569,329 @@ TEST_F(InputMethodMacTest, TouchBarTextSuggestionsInvalidSelection) {
   EXPECT_EQ(firstSequenceNumber, secondSequenceNumber);
 }
 
-// The tests below cover the text substitutions accept path. A correction is
-// computed against the available text window as it stood when the correction
-// indicator was shown, but it is applied later, when AppKit reports that the
-// user accepted it. The window may have moved in between, so the accept path
-// has to re-check the correction against the current window before using it to
-// index into the text.
+class FakeTextInputClientMacDelegate
+    : public TextInputClientMac::AsyncRequestDelegate {
+ public:
+  FakeTextInputClientMacDelegate() = default;
+  ~FakeTextInputClientMacDelegate() override = default;
 
-// Sanity check for the two tests that follow: a correction that still lies
-// inside the available text window is applied.
-TEST_F(InputMethodMacTest, TextSubstitutionAppliedWithinAvailableTextWindow) {
-  FakeSpellChecker* spellChecker = [[FakeSpellChecker alloc] init];
-  tab_GetInProcessNSView().spellCheckerForTesting =
-      static_cast<NSSpellChecker*>(spellChecker);
-  SetTextInputType(tab_view(), ui::TEXT_INPUT_TYPE_TEXT);
+  void SetResponseRect(const gfx::Rect& rect) { response_rect_ = rect; }
 
-  // The available text window holds "omw home" starting at document offset 10.
-  const std::u16string kAvailableText = u"omw home";
-  tab_view()->SelectionChanged(kAvailableText, 10, gfx::Range(13, 13));
+  void GetCharacterIndexAtPoint(
+      RenderFrameHost* rfh,
+      const TextInputClientMac::RequestToken& request_token,
+      const gfx::Point& point) override {
+    FAIL() << "Unexpected call to GetCharacterIndexAtPoint";
+  }
+
+  void GetFirstRectForRange(
+      RenderFrameHost* rfh,
+      const TextInputClientMac::RequestToken& request_token,
+      const gfx::Range& range) override {
+    TextInputClientMac::GetInstance()->SetFirstRectWhileLockedForTesting(
+        request_token, response_rect_);
+  }
+
+ private:
+  gfx::Rect response_rect_;
+};
+
+// Shared harness for the text substitution tests: enables Text Replacement
+// via the per-app override, installs a fake spell checker, and answers the
+// renderer-layout rect query so the correction indicator anchors the way it
+// does in production.
+class TextSubstitutionTest : public InputMethodMacTest {
+ public:
+  void SetUp() override {
+    InputMethodMacTest::SetUp();
+    spell_checker_ = [[FakeSpellChecker alloc] init];
+    tab_GetInProcessNSView().spellCheckerForTesting =
+        static_cast<NSSpellChecker*>(spell_checker_);
+    SetTextInputType(tab_view(), ui::TEXT_INPUT_TYPE_TEXT);
+    contents()->GetPrimaryFrameTree().SetFocusedFrame(
+        contents()->GetPrimaryFrameTree().root(), nullptr);
+    auto delegate = std::make_unique<FakeTextInputClientMacDelegate>();
+    delegate->SetResponseRect(gfx::Rect(5, 10, 40, 15));
+    TextInputClientMac::GetInstance()->SetAsyncRequestDelegateForTesting(
+        std::move(delegate));
+  }
+
+  void TearDown() override {
+    // Cancel any indicator show still scheduled behind the typing-pause
+    // delay so it cannot fire into a later test.
+    [NSObject cancelPreviousPerformRequestsWithTarget:tab_GetInProcessNSView()];
+    TextInputClientMac::GetInstance()->SetAsyncRequestDelegateForTesting(
+        nullptr);
+    InputMethodMacTest::TearDown();
+  }
+
+ protected:
+  ScopedAutomaticTextReplacementOverride replacement_enabled_{true};
+  FakeSpellChecker* __strong spell_checker_;
+};
+
+// The tests below cover the text substitutions offer/accept path. A
+// substitution candidate is computed against the available text window as it
+// stood when a check ran, but it is applied later — when the user's own
+// keystroke lands a word boundary behind the substituted word, or when the
+// user clicks the correction indicator. The window and the text may have
+// changed in between, so every application path has to re-arbitrate the
+// candidate against the current text state before using it to index into the
+// text.
+
+// Sanity check for the tests that follow: a substitution whose word the user
+// completes with a boundary keystroke is applied at its document range.
+TEST_F(TextSubstitutionTest, TextSubstitutionAppliedWithinAvailableTextWindow) {
+  // The available text window holds "omw" starting at document offset 10,
+  // with the insertion point at the end of the word. The parked substitution
+  // refers to document range [10, 13), inside the window.
+  tab_view()->SelectionChanged(u"omw", 10, gfx::Range(13, 13));
   base::RunLoop().RunUntilIdle();
   host_->GetAndResetDispatchedMessages();
 
-  // "omw" occupies document range [10, 13), which is inside the window.
-  FakeTextCheckingResult* correction =
-      [FakeTextCheckingResult resultWithRange:NSMakeRange(10, 3)
-                            replacementString:@"On my way"];
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
 
-  [tab_GetInProcessNSView()
-      didAcceptReplacementString:@"On my way"
-           forTextCheckingResult:static_cast<NSTextCheckingResult*>(correction)
-                withChangeNumber:0];
+  // A word boundary arrives; the substitution applies at its document range.
+  tab_view()->SelectionChanged(u"omw ", 10, gfx::Range(14, 14));
   base::RunLoop().RunUntilIdle();
 
   MockWidgetInputHandler::MessageVector events =
       host_->GetAndResetDispatchedMessages();
-  EXPECT_EQ("CommitText", GetMessageNames(events));
+  ASSERT_EQ("CommitText", GetMessageNames(events));
+  MockWidgetInputHandler::DispatchedIMEMessage* ime_message =
+      events[0]->ToIME();
+  ASSERT_TRUE(ime_message);
+  EXPECT_TRUE(ime_message->Matches(u"On my way!",
+                                   std::vector<ui::ImeTextSpan>(),
+                                   gfx::Range(10, 13), 0, 0,
+                                   blink::mojom::ImeState::kNone,
+                                   blink::DOMNodeIdType()));
 }
 
-// Regression test: if the window has scrolled past the correction entirely,
-// the correction's position relative to the window is negative. Computing it
-// underflows NSUInteger and the subsequent -substringWithRange: raises.
-TEST_F(InputMethodMacTest, TextSubstitutionIgnoredWhenWindowMovedPast) {
-  FakeSpellChecker* spellChecker = [[FakeSpellChecker alloc] init];
-  tab_GetInProcessNSView().spellCheckerForTesting =
-      static_cast<NSSpellChecker*>(spellChecker);
-  SetTextInputType(tab_view(), ui::TEXT_INPUT_TYPE_TEXT);
-
-  // The window now starts at document offset 40, well past the correction.
-  const std::u16string kAvailableText = u"omw home";
-  tab_view()->SelectionChanged(kAvailableText, 40, gfx::Range(43, 43));
+// Regression test: if the window has scrolled past the substitution entirely,
+// its position relative to the window is negative. Computing it underflows
+// NSUInteger and the subsequent -substringWithRange: raises.
+TEST_F(TextSubstitutionTest, TextSubstitutionIgnoredWhenWindowMovedPast) {
+  tab_view()->SelectionChanged(u"omw", 10, gfx::Range(13, 13));
   base::RunLoop().RunUntilIdle();
   host_->GetAndResetDispatchedMessages();
 
-  // The correction still refers to document range [10, 13), which is below the
-  // window. Note this passes the upper bound check: 13 is less than the
-  // window's end at 48.
-  FakeTextCheckingResult* correction =
-      [FakeTextCheckingResult resultWithRange:NSMakeRange(10, 3)
-                            replacementString:@"On my way"];
-
-  [tab_GetInProcessNSView()
-      didAcceptReplacementString:@"On my way"
-           forTextCheckingResult:static_cast<NSTextCheckingResult*>(correction)
-                withChangeNumber:0];
+  [tab_GetInProcessNSView() requestTextSubstitutions];
   base::RunLoop().RunUntilIdle();
 
-  MockWidgetInputHandler::MessageVector events =
-      host_->GetAndResetDispatchedMessages();
-  EXPECT_EQ("", GetMessageNames(events));
+  // The window moves well past the held substitution's document range
+  // [10, 13) before any boundary arrives. Note the upper bound alone would
+  // pass: 13 is less than the window's end at 48. Without the lower bound
+  // the window-relative arithmetic underflows and crashes in
+  // -doubleClickAtIndex:.
+  tab_view()->SelectionChanged(u"and more", 40, gfx::Range(48, 48));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  // A boundary in the new window must not resurrect it either.
+  tab_view()->SelectionChanged(u"and more ", 40, gfx::Range(49, 49));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
 }
 
 // The mirror image of the above, covering the bound the accept path already
 // checked, so that a later change cannot drop one without the other.
-TEST_F(InputMethodMacTest, TextSubstitutionIgnoredWhenExtendingPastWindow) {
-  FakeSpellChecker* spellChecker = [[FakeSpellChecker alloc] init];
-  tab_GetInProcessNSView().spellCheckerForTesting =
-      static_cast<NSSpellChecker*>(spellChecker);
-  SetTextInputType(tab_view(), ui::TEXT_INPUT_TYPE_TEXT);
-
-  const std::u16string kAvailableText = u"omw home";
-  tab_view()->SelectionChanged(kAvailableText, 0, gfx::Range(3, 3));
+TEST_F(TextSubstitutionTest, TextSubstitutionIgnoredWhenExtendingPastWindow) {
+  tab_view()->SelectionChanged(u"omw", 10, gfx::Range(13, 13));
   base::RunLoop().RunUntilIdle();
   host_->GetAndResetDispatchedMessages();
 
-  // The correction runs to document offset 15, past the window's end at 8.
-  FakeTextCheckingResult* correction =
-      [FakeTextCheckingResult resultWithRange:NSMakeRange(5, 10)
-                            replacementString:@"On my way"];
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
 
-  [tab_GetInProcessNSView()
-      didAcceptReplacementString:@"On my way"
-           forTextCheckingResult:static_cast<NSTextCheckingResult*>(correction)
-                withChangeNumber:0];
+  // The window shrinks so the held substitution's range [10, 13) runs past
+  // the window's end at 12.
+  tab_view()->SelectionChanged(u"om", 10, gfx::Range(12, 12));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  tab_view()->SelectionChanged(u"om ", 10, gfx::Range(13, 13));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+}
+
+// A held substitution must not apply if the user goes on typing word
+// characters — the word it was computed for no longer exists.
+TEST_F(TextSubstitutionTest, TextSubstitutionNotAppliedWhenWordContinues) {
+  tab_view()->SelectionChanged(u"omw", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  // The word keeps growing: the held substitution must be dropped, both now
+  // and when a boundary arrives later.
+  tab_view()->SelectionChanged(u"omwq", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  tab_view()->SelectionChanged(u"omwq ", 0, gfx::Range(5, 5));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+}
+
+// A held substitution dies when the insertion point leaves the end of the
+// word: its context is gone, and a boundary typed later must not resurrect
+// it.
+TEST_F(TextSubstitutionTest, TextSubstitutionDroppedWhenInsertionPointLeaves) {
+  tab_view()->SelectionChanged(u"omw", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  // The user clicks back into the middle of the word.
+  tab_view()->SelectionChanged(u"omw", 0, gfx::Range(1, 1));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  // Even though a boundary now exists at the word's end, the dropped offer
+  // stays dropped.
+  tab_view()->SelectionChanged(u"omw ", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+}
+
+// A substitution candidate for the word being typed is held, not applied,
+// even when text exists after the insertion point — typing in front of
+// existing content must not have the candidate applied to the half-typed
+// word.
+TEST_F(TextSubstitutionTest, TextSubstitutionHeldWhileTypingBeforeExistingText) {
+  // The insertion point sits at the end of "omw", with " more" after it.
+  tab_view()->SelectionChanged(u"omw more", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  // Trailing text alone is not an accept signal: the candidate is held.
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  // The user keeps typing the word; the candidate must be dropped, not
+  // applied.
+  tab_view()->SelectionChanged(u"omwx more", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+}
+
+// Clicking the indicator accepts the offer immediately: AppKit resolves the
+// indicator with the accepted string, and with no key event in flight the
+// resolution applies on the spot, guarded by the word's text being
+// unchanged.
+TEST_F(TextSubstitutionTest, TextSubstitutionClickOnIndicatorApplies) {
+  tab_view()->SelectionChanged(u"omw", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ(1u, spell_checker_.indicatorShowCount);
+  EXPECT_NSEQ(@"On my way!", spell_checker_.shownPrimaryString);
+  EXPECT_EQ(NSCorrectionIndicatorTypeDefault, spell_checker_.shownIndicatorType);
+
+  spell_checker_.correctionCompletionHandler(@"On my way!");
   base::RunLoop().RunUntilIdle();
 
   MockWidgetInputHandler::MessageVector events =
       host_->GetAndResetDispatchedMessages();
-  EXPECT_EQ("", GetMessageNames(events));
+  ASSERT_EQ("CommitText", GetMessageNames(events));
+  MockWidgetInputHandler::DispatchedIMEMessage* ime_message =
+      events[0]->ToIME();
+  ASSERT_TRUE(ime_message);
+  EXPECT_TRUE(ime_message->Matches(u"On my way!",
+                                   std::vector<ui::ImeTextSpan>(),
+                                   gfx::Range(0, 3), 0, 0,
+                                   blink::mojom::ImeState::kNone,
+                                   blink::DOMNodeIdType()));
+}
+
+// AppKit resolving the indicator with no string — Escape, or the dismiss
+// control — kills the offer: a boundary typed afterwards must not apply it.
+TEST_F(TextSubstitutionTest, TextSubstitutionEscapeDropsOffer) {
+  tab_view()->SelectionChanged(u"omw", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ(1u, spell_checker_.indicatorShowCount);
+
+  spell_checker_.correctionCompletionHandler(nil);
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  tab_view()->SelectionChanged(u"omw ", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+}
+
+// The arbitration kill switch, accept half: with
+// kMacSubstitutionTextStateArbitration disabled, an indicator resolution
+// carrying a string applies whatever caused it — the accept-on-resolution
+// behavior the arbitration replaced. A key event passing through the view
+// ahead of the resolution must not defer it.
+TEST_F(TextSubstitutionTest, KeyEventResolutionAppliesWithArbitrationDisabled) {
+  base::test::ScopedFeatureList feature_list;
+  feature_list.InitAndDisableFeature(
+      features::kMacSubstitutionTextStateArbitration);
+
+  tab_view()->SelectionChanged(u"omw", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  [tab_GetInProcessNSView() showPendingSubstitutionIndicatorNow];
+  base::RunLoop().RunUntilIdle();
+  ASSERT_EQ(1u, spell_checker_.indicatorShowCount);
+  ASSERT_TRUE(spell_checker_.correctionCompletionHandler);
+
+  // A key event passes through the view, then AppKit's resolution of the
+  // indicator arrives with the accepted string.
+  [tab_GetInProcessNSView()
+      keyEvent:cocoa_test_event_utils::KeyEventWithKeyCode(
+                   0x31, ' ', NSEventTypeKeyDown, 0)];
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  spell_checker_.correctionCompletionHandler(@"On my way!");
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("CommitText",
+            GetMessageNames(host_->GetAndResetDispatchedMessages()));
+}
+
+// The arbitration kill switch, boundary half: with
+// kMacSubstitutionTextStateArbitration disabled, a held offer does not apply
+// silently at a word boundary — only an indicator resolution applies it.
+// (TextSubstitutionAppliedWithinAvailableTextWindow pins the flag-on
+// behavior for the same sequence.)
+TEST_F(TextSubstitutionTest, BoundaryDoesNotApplySilentlyWithArbitrationDisabled) {
+  base::test::ScopedFeatureList feature_list;
+  feature_list.InitAndDisableFeature(
+      features::kMacSubstitutionTextStateArbitration);
+
+  tab_view()->SelectionChanged(u"omw", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  tab_view()->SelectionChanged(u"omw ", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
 }
 
 // Regression test: when the renderer's text updates lag behind typing, the
@@ -2672,13 +2899,7 @@ TEST_F(InputMethodMacTest, TextSubstitutionIgnoredWhenExtendingPastWindow) {
 // arrives. Substitution checks must stay one-to-one with keystrokes — with a
 // one-shot flag, the first (premature) update consumes it, the update that
 // completes the word runs no check, and the substitution is silently lost.
-TEST_F(InputMethodMacTest, TextSubstitutionOfferedWhenUpdatesLagTyping) {
-  ScopedAutomaticTextReplacementOverride replacement_enabled(true);
-  FakeSpellChecker* spellChecker = [[FakeSpellChecker alloc] init];
-  tab_GetInProcessNSView().spellCheckerForTesting =
-      static_cast<NSSpellChecker*>(spellChecker);
-  SetTextInputType(tab_view(), ui::TEXT_INPUT_TYPE_TEXT);
-
+TEST_F(TextSubstitutionTest, TextSubstitutionOfferedWhenUpdatesLagTyping) {
   // The user types "omw " in one fast burst: all four key events are
   // processed before any renderer update arrives.
   [tab_GetInProcessNSView()
@@ -2703,12 +2924,12 @@ TEST_F(InputMethodMacTest, TextSubstitutionOfferedWhenUpdatesLagTyping) {
   tab_view()->SelectionChanged(u"omw", 0, gfx::Range(3, 3));
   base::RunLoop().RunUntilIdle();
   host_->GetAndResetDispatchedMessages();
-  EXPECT_EQ(1u, spellChecker.indicatorShowCount);
-  ASSERT_TRUE(spellChecker.correctionCompletionHandler);
+  EXPECT_EQ(1u, spell_checker_.indicatorShowCount);
+  ASSERT_TRUE(spell_checker_.correctionCompletionHandler);
 
   // AppKit reports that the user accepted the offer; the substitution
   // applies at its range.
-  spellChecker.correctionCompletionHandler(@"On my way!");
+  spell_checker_.correctionCompletionHandler(@"On my way!");
   base::RunLoop().RunUntilIdle();
 
   MockWidgetInputHandler::MessageVector events =
@@ -2837,33 +3058,6 @@ TEST_F(RenderWidgetHostViewMacTest, AccessibilityParentTest) {
   rwhv_mac_->SetParentAccessibilityElement(nil);
   EXPECT_NSEQ([view accessibilityParent], parent_view);
 }
-
-class FakeTextInputClientMacDelegate
-    : public TextInputClientMac::AsyncRequestDelegate {
- public:
-  FakeTextInputClientMacDelegate() = default;
-  ~FakeTextInputClientMacDelegate() override = default;
-
-  void SetResponseRect(const gfx::Rect& rect) { response_rect_ = rect; }
-
-  void GetCharacterIndexAtPoint(
-      RenderFrameHost* rfh,
-      const TextInputClientMac::RequestToken& request_token,
-      const gfx::Point& point) override {
-    FAIL() << "Unexpected call to GetCharacterIndexAtPoint";
-  }
-
-  void GetFirstRectForRange(
-      RenderFrameHost* rfh,
-      const TextInputClientMac::RequestToken& request_token,
-      const gfx::Range& range) override {
-    TextInputClientMac::GetInstance()->SetFirstRectWhileLockedForTesting(
-        request_token, response_rect_);
-  }
-
- private:
-  gfx::Rect response_rect_;
-};
 
 TEST_F(RenderWidgetHostViewMacTest, SyncGetFirstRectForRange_Clamped) {
   base::test::ScopedFeatureList feature_list;

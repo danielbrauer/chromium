@@ -148,6 +148,15 @@ BASE_FEATURE(kCachedFirstRectAllowInvalidSelection,
 
 BASE_FEATURE(kCancelCompositionWhenWindowLosesFocus,
              base::FEATURE_ENABLED_BY_DEFAULT);
+
+// Kill switch for arbitrating macOS substitution acceptance by text state:
+// enabled, an indicator resolution caused by a key event defers to the text
+// arbitration, and a held offer applies silently when the user's keystroke
+// lands a word boundary behind it. Disabling restores accept-on-resolution:
+// any indicator resolution carrying a string applies immediately, whatever
+// caused it, and offers apply only through the indicator.
+BASE_FEATURE(kMacSubstitutionTextStateArbitration,
+             base::FEATURE_ENABLED_BY_DEFAULT);
 #endif  // BUILDFLAG(IS_MAC)
 
 // When enabled, CDP method Page.captureScreenshot will increment

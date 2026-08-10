@@ -67,6 +67,7 @@ CONTENT_EXPORT BASE_DECLARE_FEATURE(kCachedFirstRectMoreSelectionFallbacks);
 CONTENT_EXPORT BASE_DECLARE_FEATURE(kCachedFirstRectAllowRangeOutsideSelection);
 CONTENT_EXPORT BASE_DECLARE_FEATURE(kCachedFirstRectAllowInvalidSelection);
 CONTENT_EXPORT BASE_DECLARE_FEATURE(kCancelCompositionWhenWindowLosesFocus);
+CONTENT_EXPORT BASE_DECLARE_FEATURE(kMacSubstitutionTextStateArbitration);
 #endif  // BUILDFLAG(IS_MAC)
 CONTENT_EXPORT BASE_DECLARE_FEATURE(kCDPScreenshotNewSurface);
 CONTENT_EXPORT BASE_DECLARE_FEATURE(kCodeCacheDeletionWithoutFilter);

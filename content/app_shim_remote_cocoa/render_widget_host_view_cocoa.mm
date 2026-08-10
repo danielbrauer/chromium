@@ -15,7 +15,6 @@
 
 #import "base/apple/foundation_util.h"
 #include "base/apple/owned_objc.h"
-#include "base/debug/crash_logging.h"
 #include "base/functional/bind.h"
 #import "base/mac/mac_util.h"
 #include "base/memory/raw_ptr.h"
@@ -406,6 +405,12 @@ gfx::PointF GetSanitizedFlippedPoint(NSPoint point, CGFloat height) {
 
   NSCandidateListTouchBarItem* __strong _candidateListTouchBarItem;
   NSInteger _textSuggestionsSequenceNumber;
+  NSTextCheckingResult* __strong _pendingSubstitution;
+  NSString* __strong _pendingSubstitutionOriginal;
+  NSTextCheckingResult* __strong _shownSubstitution;
+  NSString* __strong _shownSubstitutionOriginal;
+  NSUInteger _keyEventCount;
+  NSUInteger _keyEventCountAtIndicatorShow;
   NSUInteger _pendingTextSubstitutionChecks;
   BOOL _substitutionWasApplied;
   bool _sonomaAccessibilityRefinementsAreActive;
@@ -505,51 +510,98 @@ static NSWindow* __weak _deferredResignKeyWindow;
                          orthography:nullptr
                            wordCount:nullptr];
 
+  // A candidate either covers the word still being typed (the insertion
+  // point touches its range) or the word the last keystroke just completed
+  // (its range ends one character before the insertion point). The latter
+  // is applied on the spot by -resolvePendingSubstitution's boundary
+  // guards; the former is parked until its boundary arrives.
   NSUInteger cursorLocation = _textSelectionRange.start();
-  NSTextCheckingResult* candidateResult;
+  NSTextCheckingResult* wordBeingTypedCandidate;
+  NSTextCheckingResult* justCompletedWordCandidate;
   for (NSTextCheckingResult* result in textCheckingResults) {
     NSTextCheckingResult* adjustedResult =
         [result resultByAdjustingRangesWithOffset:_availableTextOffset];
-    if (!NSLocationInRange(cursorLocation,
-                           NSMakeRange(adjustedResult.range.location,
-                                       adjustedResult.range.length + 1)))
-      continue;
+    BOOL touchesCursor = NSLocationInRange(
+        cursorLocation, NSMakeRange(adjustedResult.range.location,
+                                    adjustedResult.range.length + 1));
     constexpr NSTextCheckingType textCheckingTypesToReplaceImmediately =
         NSTextCheckingTypeQuote | NSTextCheckingTypeDash;
     if (adjustedResult.resultType & textCheckingTypesToReplaceImmediately) {
-      [self insertText:adjustedResult.replacementString
-          replacementRange:adjustedResult.range];
+      if (touchesCursor) {
+        [self insertText:adjustedResult.replacementString
+            replacementRange:adjustedResult.range];
+      }
       continue;
     }
-    candidateResult = adjustedResult;
+    if (touchesCursor)
+      wordBeingTypedCandidate = adjustedResult;
+    else if (cursorLocation == NSMaxRange(adjustedResult.range) + 1)
+      justCompletedWordCandidate = adjustedResult;
   }
-  if (!candidateResult)
-    return;
 
+  [self parkSubstitutionCandidate:justCompletedWordCandidate
+                           inText:availableText];
+  [self resolvePendingSubstitution];
+  [self parkSubstitutionCandidate:wordBeingTypedCandidate
+                           inText:availableText];
+  [self resolvePendingSubstitution];
+  if (_pendingSubstitution)
+    [self showPendingSubstitutionIndicatorNow];
+}
+
+// Parks `candidate` as the pending substitution, with the text it was
+// computed for as a staleness guard. A nil candidate leaves the previously
+// parked one in place: the boundary that completes a word can arrive in a
+// later text update than the last check that could still see the word under
+// the insertion point.
+- (void)parkSubstitutionCandidate:(NSTextCheckingResult*)candidate
+                           inText:(NSString*)availableText {
+  if (!candidate)
+    return;
+  NSRange rangeInAvailableText = NSMakeRange(
+      candidate.range.location - _availableTextOffset, candidate.range.length);
+  NSString* originalString =
+      [availableText substringWithRange:rangeInAvailableText];
+  _pendingSubstitution = candidate;
+  _pendingSubstitutionOriginal = originalString;
+}
+
+- (void)showPendingSubstitutionIndicatorNow {
+  if (!_pendingSubstitution || _shownSubstitution == _pendingSubstitution)
+    return;
+  // The indicator is an offer about the word being typed; it is only shown
+  // while the insertion point still sits at the end of that word.
+  if (!_textSelectionRange.IsValid() || !_textSelectionRange.is_empty() ||
+      _textSelectionRange.GetMin() != NSMaxRange(_pendingSubstitution.range)) {
+    return;
+  }
   // Anchor the indicator from the renderer's layout, not from
   // -firstRectForCharacterRange:, whose IME caches may approximate a word
   // range's rect with the caret's. The layout answer arrives asynchronously;
-  // the indicator is shown when it does.
-  NSUInteger capturedChangeCounter = _availableTextChangeCounter;
+  // the show completes when it does, re-validated against the offer still
+  // being current.
+  NSTextCheckingResult* result = _pendingSubstitution;
   _host->GetLayoutFirstRectForRange(
-      gfx::Range::FromPossiblyInvalidNSRange(candidateResult.range),
+      gfx::Range::FromPossiblyInvalidNSRange(result.range),
       base::BindOnce(^(const gfx::Rect& layoutRect, bool success) {
-        [self showSubstitutionIndicatorForResult:candidateResult
+        [self showSubstitutionIndicatorForResult:result
                                       layoutRect:layoutRect
-                                 layoutRectValid:success
-                                withChangeNumber:capturedChangeCounter];
+                                 layoutRectValid:success];
       }));
 }
 
-- (void)showSubstitutionIndicatorForResult:(NSTextCheckingResult*)candidateResult
+- (void)showSubstitutionIndicatorForResult:(NSTextCheckingResult*)result
                                 layoutRect:(gfx::Rect)gfxRect
-                           layoutRectValid:(bool)success
-                          withChangeNumber:(NSUInteger)capturedChangeCounter {
-  // The offer was computed against the text as it stood when the check ran.
-  // If the text changed while the layout answer was in flight, the offer is
-  // stale; the check that ran on the newer text makes its own offer.
-  if (_availableTextChangeCounter != capturedChangeCounter)
+                           layoutRectValid:(bool)success {
+  // Typing may have continued while the layout answer was in flight,
+  // re-parking or dropping the offer; a reply about a retired offer must
+  // not show. The checks mirror the ones made when the query was issued.
+  if (result != _pendingSubstitution || _shownSubstitution == result)
     return;
+  if (!_textSelectionRange.IsValid() || !_textSelectionRange.is_empty() ||
+      _textSelectionRange.GetMin() != NSMaxRange(result.range)) {
+    return;
+  }
 
   NSRect textRectInViewCoordinates = NSZeroRect;
   if (success) {
@@ -563,7 +615,7 @@ static NSWindow* __weak _deferredResignKeyWindow;
     // produce no layout rect for an arbitrary range; fall back to the
     // cached path rather than never offering there.
     NSRect textRectInScreenCoordinates =
-        [self firstRectForCharacterRange:candidateResult.range
+        [self firstRectForCharacterRange:result.range
                              actualRange:nullptr];
     NSRect textRectInWindowCoordinates =
         [self.window convertRectFromScreen:textRectInScreenCoordinates];
@@ -571,76 +623,208 @@ static NSWindow* __weak _deferredResignKeyWindow;
         [self convertRect:textRectInWindowCoordinates fromView:nil];
   }
 
+  _shownSubstitution = _pendingSubstitution;
+  _shownSubstitutionOriginal = _pendingSubstitutionOriginal;
+  _keyEventCountAtIndicatorShow = _keyEventCount;
+
+  NSString* originalString = _pendingSubstitutionOriginal;
+
   [self.spellChecker
       showCorrectionIndicatorOfType:NSCorrectionIndicatorTypeDefault
-                      primaryString:candidateResult.replacementString
-                 alternativeStrings:candidateResult.alternativeStrings
+                      primaryString:result.replacementString
+                 alternativeStrings:result.alternativeStrings
                     forStringInRect:textRectInViewCoordinates
                                view:self
                   completionHandler:^(NSString* acceptedString) {
-                    [self didAcceptReplacementString:acceptedString
-                               forTextCheckingResult:candidateResult
-                                    withChangeNumber:capturedChangeCounter];
+                    [self correctionIndicatorResolvedWithString:acceptedString
+                                          forTextCheckingResult:result
+                                                 originalString:originalString];
                   }];
 }
 
-- (void)didAcceptReplacementString:(NSString*)acceptedString
-             forTextCheckingResult:(NSTextCheckingResult*)correction
-                  withChangeNumber:(NSUInteger)changeNumber {
-  // TODO: Keep NSSpellChecker up to date on the user's response via
-  // -recordResponse:toCorrection:forWord:language:inSpellDocumentWithTag:.
-  // Call it to report whether they initially accepted or rejected the
-  // suggestion, but also if they edit, revert, etc. later.
+- (void)correctionIndicatorResolvedWithString:(NSString*)acceptedString
+                        forTextCheckingResult:(NSTextCheckingResult*)correction
+                               originalString:(NSString*)originalString {
+  // -dismissCorrectionIndicator retires the shown offer before dismissing,
+  // so if the offer is still current here, AppKit resolved the indicator on
+  // its own.
+  BOOL offerWasCurrent = _shownSubstitution == correction;
+  if (offerWasCurrent) {
+    _shownSubstitution = nil;
+    _shownSubstitutionOriginal = nil;
+  }
 
-  if (acceptedString == nil)
+  if (acceptedString) {
+    // AppKit resolves the indicator with its string not only on a click but
+    // on any key event, ahead of the keystroke's own text update, which may
+    // be about to kill the offer. The cause is directly observable: a
+    // resolution delivered during the key event's dispatch runs with that
+    // event as NSApp.currentEvent, and one deferred past the dispatch runs
+    // after the event has passed through this view and advanced
+    // _keyEventCount. A click is a resolution with neither sign, and only
+    // then is no keystroke in flight, making an immediate apply sound.
+    // Key-event resolutions defer to the text arbitration in
+    // -resolvePendingSubstitution.
+    //
+    // This discrimination rests on observed AppKit delivery timing — a
+    // synchronous resolution runs inside the causing event's dispatch, a
+    // deferred one only after that dispatch has passed through this view.
+    // Should a macOS release change that timing, the failure mode is a
+    // click misread as a key resolution: a missed accept, never a misapply.
+    NSEventType eventType = NSApp.currentEvent.type;
+    BOOL resolvedByKeyEvent = eventType == NSEventTypeKeyDown ||
+                              eventType == NSEventTypeKeyUp ||
+                              eventType == NSEventTypeFlagsChanged ||
+                              _keyEventCount != _keyEventCountAtIndicatorShow;
+    if (resolvedByKeyEvent &&
+        base::FeatureList::IsEnabled(
+            features::kMacSubstitutionTextStateArbitration)) {
+      return;
+    }
+    if ([self applySubstitution:correction
+                     withString:acceptedString
+             ifTextStillMatches:originalString]) {
+      [self clearPendingSubstitution];
+    }
+    return;
+  }
+
+  if (offerWasCurrent) {
+    // AppKit resolved with no replacement on its own: Escape, or the
+    // indicator's dismiss control. An explicit rejection kills the offer.
+    [self clearPendingSubstitution];
+    return;
+  }
+
+  // The tail of a dismissal this view performed itself; the offer's fate
+  // was decided at the dismissal site.
+}
+
+// Applies `replacement` over `correction`'s range iff that range still lies
+// within the available text window, still reads `originalString`, and no
+// substitution has been applied in this text-state cycle. Returns whether it
+// applied.
+- (BOOL)applySubstitution:(NSTextCheckingResult*)correction
+               withString:(NSString*)replacement
+       ifTextStillMatches:(NSString*)originalString {
+  if (_substitutionWasApplied)
+    return NO;
+  NSRange availableTextRange =
+      NSMakeRange(_availableTextOffset, _availableText.length());
+  if (correction.range.location < _availableTextOffset ||
+      NSMaxRange(correction.range) > NSMaxRange(availableTextRange)) {
+    return NO;
+  }
+  NSRange rangeInAvailableText = NSMakeRange(
+      correction.range.location - _availableTextOffset, correction.range.length);
+  NSString* currentString = [base::SysUTF16ToNSString(_availableText)
+      substringWithRange:rangeInAvailableText];
+  if (![currentString isEqualToString:originalString])
+    return NO;
+  _substitutionWasApplied = YES;
+  [self insertText:replacement replacementRange:correction.range];
+  return YES;
+}
+
+- (void)dismissCorrectionIndicator {
+  // Retiring the shown offer first lets the completion handler tell this
+  // dismissal from one AppKit performed on its own.
+  _shownSubstitution = nil;
+  _shownSubstitutionOriginal = nil;
+  [self.spellChecker dismissCorrectionIndicatorForView:self];
+}
+
+- (void)clearPendingSubstitution {
+  _pendingSubstitution = nil;
+  _pendingSubstitutionOriginal = nil;
+}
+
+- (void)resolvePendingSubstitution {
+  if (!_pendingSubstitution)
     return;
 
+  NSTextCheckingResult* correction = _pendingSubstitution;
   NSRange availableTextRange =
       NSMakeRange(_availableTextOffset, _availableText.length());
 
-  // If the available text window has moved past the correction, computing
+  // If the available text window has moved past the substitution, computing
   // its window-relative position below would underflow.
-  if (correction.range.location < _availableTextOffset)
+  if (correction.range.location < _availableTextOffset ||
+      NSMaxRange(correction.range) > NSMaxRange(availableTextRange)) {
+    [self dropPendingSubstitutionUnaccepted];
     return;
-
-  if (NSMaxRange(correction.range) > NSMaxRange(availableTextRange))
-    return;
+  }
 
   NSAttributedString* attString = [[NSAttributedString alloc]
       initWithString:base::SysUTF16ToNSString(_availableText)];
+  NSRange rangeInAvailableText = NSMakeRange(
+      correction.range.location - _availableTextOffset, correction.range.length);
+
+  // The word the candidate was computed for has to still be there.
+  if (![[attString.string substringWithRange:rangeInAvailableText]
+          isEqualToString:_pendingSubstitutionOriginal]) {
+    [self dropPendingSubstitutionUnaccepted];
+    return;
+  }
+
+  // What accepts a substitution is the user's own keystroke landing a word
+  // boundary directly behind the word, not whatever text happens to follow
+  // it, which proves nothing when typing in front of existing content.
+  if (!_textSelectionRange.IsValid() || !_textSelectionRange.is_empty()) {
+    [self dropPendingSubstitutionUnaccepted];
+    return;
+  }
+  NSUInteger caretLocation = _textSelectionRange.GetMin();
+  if (caretLocation == NSMaxRange(correction.range)) {
+    // The user may still be mid-word; hold the candidate for the next
+    // update.
+    return;
+  }
+  if (caretLocation != NSMaxRange(correction.range) + 1) {
+    // The insertion point is anywhere else: the offer's context is gone.
+    [self dropPendingSubstitutionUnaccepted];
+    return;
+  }
+
   NSRange trailingRange = NSMakeRange(
       NSMaxRange(correction.range),
       NSMaxRange(availableTextRange) - NSMaxRange(correction.range));
-
-  if (trailingRange.length > 0 &&
-      trailingRange.location < NSMaxRange(availableTextRange)) {
-    NSRange trailingRangeInAvailableText = NSMakeRange(
-        trailingRange.location - _availableTextOffset, trailingRange.length);
-    NSString* trailingString =
-        [attString.string substringWithRange:trailingRangeInAvailableText];
-    if ([self.spellChecker preventsAutocorrectionBeforeString:trailingString
-                                                     language:nil])
-      return;
-
-    // Gather some info in case -doubleClickAtIndex: throws an exception.
-    // This change will eventually be reverted.
-    NSString* info = [NSString
-        stringWithFormat:@"%lu == %lu %lu %@ %@ %@ %@", changeNumber,
-                         _availableTextChangeCounter, attString.string.length,
-                         NSStringFromRange(availableTextRange),
-                         NSStringFromRange(correction.range),
-                         NSStringFromRange(trailingRange),
-                         NSStringFromRange(trailingRangeInAvailableText)];
-    SCOPED_CRASH_KEY_STRING256("RenderWidgetHostViewCocoa", "didAcceptTR",
-                               base::SysNSStringToUTF8(info));
-
-    if ([attString doubleClickAtIndex:trailingRangeInAvailableText.location]
-            .location < trailingRangeInAvailableText.location)
-      return;
+  NSRange trailingRangeInAvailableText = NSMakeRange(
+      trailingRange.location - _availableTextOffset, trailingRange.length);
+  NSString* trailingString =
+      [attString.string substringWithRange:trailingRangeInAvailableText];
+  if ([self.spellChecker preventsAutocorrectionBeforeString:trailingString
+                                                   language:nil]) {
+    [self dropPendingSubstitutionUnaccepted];
+    return;
   }
 
-  _substitutionWasApplied = YES;
-  [self insertText:acceptedString replacementRange:correction.range];
+  if ([attString doubleClickAtIndex:trailingRangeInAvailableText.location]
+          .location < trailingRangeInAvailableText.location) {
+    // The character behind the word continues it rather than bounding it:
+    // the user typed through the offer.
+    [self dropPendingSubstitutionUnaccepted];
+    return;
+  }
+
+  // Kill switch: with text-state arbitration disabled, a held offer applies
+  // only through the indicator's resolution, never silently at a boundary —
+  // the accept model this arbitration replaced. The candidate stays parked
+  // for the indicator.
+  if (!base::FeatureList::IsEnabled(
+          features::kMacSubstitutionTextStateArbitration)) {
+    return;
+  }
+
+  [self applySubstitution:correction
+               withString:correction.replacementString
+       ifTextStillMatches:_pendingSubstitutionOriginal];
+  [self clearPendingSubstitution];
+}
+
+// Clears the pending substitution without applying it.
+- (void)dropPendingSubstitutionUnaccepted {
+  [self clearPendingSubstitution];
 }
 
 - (void)requestTextSuggestions {
@@ -770,16 +954,27 @@ static NSWindow* __weak _deferredResignKeyWindow;
 - (void)setTextSelectionText:(std::u16string)text
                       offset:(size_t)offset
                        range:(gfx::Range)range {
+  BOOL updateFollowsTyping = _pendingTextSubstitutionChecks > 0;
   _availableText = text;
   _availableTextOffset = offset;
   _availableTextChangeCounter++;
   _textSelectionRange = range;
   _substitutionWasApplied = NO;
-  [self.spellChecker dismissCorrectionIndicatorForView:self];
-  if (_pendingTextSubstitutionChecks > 0 && !_substitutionWasApplied &&
+
+  // Continuing the word rejects a visible offer; a boundary keystroke or a
+  // click on the indicator accepts it. Deliberately more conservative than
+  // AppKit's own accept-on-any-key resolution.
+  [self dismissCorrectionIndicator];
+
+  if (updateFollowsTyping && !_substitutionWasApplied &&
       _textSelectionRange.is_empty()) {
     _pendingTextSubstitutionChecks--;
     [self requestTextSubstitutions];
+  } else if (!updateFollowsTyping) {
+    // Text or selection changed by something other than typing: re-arbitrate
+    // the parked candidate against the new text state. A caret that left its
+    // word kills the offer.
+    [self resolvePendingSubstitution];
   }
   [self requestTextSuggestions];
 }
@@ -1464,6 +1659,10 @@ static NSWindow* __weak _deferredResignKeyWindow;
 - (void)keyEvent:(NSEvent*)theEvent wasKeyEquivalent:(BOOL)equiv {
   TRACE_EVENT1("browser", "RenderWidgetHostViewCocoa::keyEvent", "WindowNum",
                [[self window] windowNumber]);
+  // Any key event may have resolved a visible correction indicator;
+  // -correctionIndicatorResolvedWithString: compares this ledger against its
+  // value when the indicator was shown to tell such resolutions from clicks.
+  _keyEventCount++;
   NSEventType eventType = [theEvent type];
   NSEventModifierFlags modifierFlags = [theEvent modifierFlags];
   int keyCode = [theEvent keyCode];
@@ -2907,7 +3106,7 @@ extern NSString* NSTextInputReplacementRangeAttributeName;
 }
 
 - (void)cancelComposition {
-  [NSSpellChecker.sharedSpellChecker dismissCorrectionIndicatorForView:self];
+  [self dismissCorrectionIndicator];
 
   if (!_hasMarkedText)
     return;
