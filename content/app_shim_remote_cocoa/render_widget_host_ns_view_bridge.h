@@ -71,6 +71,7 @@ class RenderWidgetHostNSViewBridge : public mojom::RenderWidgetHostNSView,
   void SetTooltipText(const std::u16string& display_text) override;
   void SetTextInputState(ui::TextInputType text_input_type,
                          uint32_t flags) override;
+  void SetIsOffTheRecord(bool is_off_the_record) override;
   void SetTextSelection(const std::u16string& text,
                         uint64_t offset,
                         const gfx::Range& range) override;

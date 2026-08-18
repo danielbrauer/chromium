@@ -77,6 +77,11 @@ interface RenderWidgetHostNSView {
   // Forward changes in content::TextInputState.
   SetTextInputState(ui.mojom.TextInputType text_input_type, uint32 flags);
 
+  // Indicate whether the hosting profile is off the record. Typing in such
+  // a profile must leave no trace in per-user system services, so the NSView
+  // withholds spell checker response learning.
+  SetIsOffTheRecord(bool is_off_the_record);
+
   // Forward the TextInputManager::TextSelection from the renderer.
   SetTextSelection(mojo_base.mojom.String16 text,
                    uint64 offset,

@@ -421,6 +421,8 @@ gfx::PointF GetSanitizedFlippedPoint(NSPoint point, CGFloat height) {
   NSInteger _spellDocumentTag;
   NSTextCheckingResult* __strong _pendingSubstitution;
   NSString* __strong _pendingSubstitutionOriginal;
+  NSString* __strong _pendingSubstitutionLanguage;
+  BOOL _pendingSubstitutionWasShown;
   NSTextCheckingResult* __strong _shownSubstitution;
   NSString* __strong _shownSubstitutionOriginal;
   NSString* __strong _rejectedSubstitutionOriginal;
@@ -438,6 +440,7 @@ gfx::PointF GetSanitizedFlippedPoint(NSPoint point, CGFloat height) {
 @synthesize markedRange = _markedRange;
 @synthesize textInputType = _textInputType;
 @synthesize textInputFlags = _textInputFlags;
+@synthesize isOffTheRecord = _isOffTheRecord;
 @synthesize spellCheckerForTesting = _spellCheckerForTesting;
 
 // Static storage for the class property deferredResignKeyWindow
@@ -553,9 +556,14 @@ static NSWindow* __weak _deferredResignKeyWindow;
   NSUInteger cursorLocation = _textSelectionRange.start();
   NSTextCheckingResult* wordBeingTypedCandidate;
   NSTextCheckingResult* justCompletedWordCandidate;
+  NSString* dominantLanguage;
   for (NSTextCheckingResult* result in textCheckingResults) {
     NSTextCheckingResult* adjustedResult =
         [result resultByAdjustingRangesWithOffset:_availableTextOffset];
+    if (adjustedResult.resultType == NSTextCheckingTypeOrthography) {
+      dominantLanguage = adjustedResult.orthography.dominantLanguage;
+      continue;
+    }
     if (!adjustedResult.replacementString)
       continue;
     BOOL touchesCursor = NSLocationInRange(
@@ -577,10 +585,12 @@ static NSWindow* __weak _deferredResignKeyWindow;
   }
 
   [self parkSubstitutionCandidate:justCompletedWordCandidate
-                           inText:availableText];
+                           inText:availableText
+                         language:dominantLanguage];
   [self resolvePendingSubstitution];
   [self parkSubstitutionCandidate:wordBeingTypedCandidate
-                           inText:availableText];
+                           inText:availableText
+                         language:dominantLanguage];
   [self resolvePendingSubstitution];
   if (_pendingSubstitution)
     [self scheduleSubstitutionIndicatorAfterPause];
@@ -592,7 +602,8 @@ static NSWindow* __weak _deferredResignKeyWindow;
 // later text update than the last check that could still see the word under
 // the insertion point.
 - (void)parkSubstitutionCandidate:(NSTextCheckingResult*)candidate
-                           inText:(NSString*)availableText {
+                           inText:(NSString*)availableText
+                         language:(NSString*)language {
   if (!candidate)
     return;
   NSRange rangeInAvailableText = NSMakeRange(
@@ -608,8 +619,24 @@ static NSWindow* __weak _deferredResignKeyWindow;
       NSEqualRanges(_rejectedSubstitutionRange, candidate.range)) {
     return;
   }
+  // A fresh result for the same word and replacement is the same offer; it
+  // keeps the shown status so an acceptance still records. A different offer
+  // displacing a shown one means the shown one was typed through unaccepted.
+  BOOL sameOffer =
+      _pendingSubstitution &&
+      NSEqualRanges(_pendingSubstitution.range, candidate.range) &&
+      [_pendingSubstitution.replacementString
+          isEqualToString:candidate.replacementString];
+  if (_pendingSubstitutionWasShown && !sameOffer) {
+    [self recordSubstitutionResponse:NSCorrectionResponseIgnored
+                        toCorrection:_pendingSubstitution.replacementString
+                             forWord:_pendingSubstitutionOriginal
+                            language:_pendingSubstitutionLanguage];
+    _pendingSubstitutionWasShown = NO;
+  }
   _pendingSubstitution = candidate;
   _pendingSubstitutionOriginal = originalString;
+  _pendingSubstitutionLanguage = language;
 }
 
 - (void)scheduleSubstitutionIndicatorAfterPause {
@@ -691,6 +718,7 @@ static NSWindow* __weak _deferredResignKeyWindow;
         [self convertRect:textRectInWindowCoordinates fromView:nil];
   }
 
+  _pendingSubstitutionWasShown = YES;
   _shownSubstitution = _pendingSubstitution;
   _shownSubstitutionOriginal = _pendingSubstitutionOriginal;
   _keyEventCountAtIndicatorShow = _keyEventCount;
@@ -752,6 +780,10 @@ static NSWindow* __weak _deferredResignKeyWindow;
     if ([self applySubstitution:correction
                      withString:acceptedString
              ifTextStillMatches:originalString]) {
+      [self recordSubstitutionResponse:NSCorrectionResponseAccepted
+                          toCorrection:acceptedString
+                               forWord:originalString
+                              language:_pendingSubstitutionLanguage];
       [self clearPendingSubstitution];
     }
     return;
@@ -764,6 +796,10 @@ static NSWindow* __weak _deferredResignKeyWindow;
     _rejectedSubstitutionOriginal = originalString;
     _rejectedSubstitutionReplacement = correction.replacementString;
     _rejectedSubstitutionRange = correction.range;
+    [self recordSubstitutionResponse:NSCorrectionResponseRejected
+                        toCorrection:correction.replacementString
+                             forWord:originalString
+                            language:_pendingSubstitutionLanguage];
     [self clearPendingSubstitution];
     return;
   }
@@ -798,6 +834,23 @@ static NSWindow* __weak _deferredResignKeyWindow;
   return YES;
 }
 
+- (void)recordSubstitutionResponse:(NSCorrectionResponse)response
+                      toCorrection:(NSString*)correction
+                           forWord:(NSString*)word
+                          language:(NSString*)language {
+  // Off-the-record typing must not train the per-user correction model, as
+  // WebKit ephemeral sessions do with CorrectionPanel. Corrections still
+  // apply; only the learning write is withheld.
+  if (_isOffTheRecord) {
+    return;
+  }
+  [self.spellChecker recordResponse:response
+                       toCorrection:correction
+                            forWord:word
+                           language:language
+             inSpellDocumentWithTag:self.spellDocumentTag];
+}
+
 - (void)dismissCorrectionIndicator {
   // Retiring the shown offer first lets the completion handler tell this
   // dismissal from one AppKit performed on its own.
@@ -809,6 +862,8 @@ static NSWindow* __weak _deferredResignKeyWindow;
 - (void)clearPendingSubstitution {
   _pendingSubstitution = nil;
   _pendingSubstitutionOriginal = nil;
+  _pendingSubstitutionLanguage = nil;
+  _pendingSubstitutionWasShown = NO;
 }
 
 - (void)resolvePendingSubstitution {
@@ -888,14 +943,30 @@ static NSWindow* __weak _deferredResignKeyWindow;
     return;
   }
 
-  [self applySubstitution:correction
-               withString:correction.replacementString
-       ifTextStillMatches:_pendingSubstitutionOriginal];
+  // An offer the user saw and then completed with a boundary is an
+  // acceptance; at typing speed nothing was shown and nothing is recorded.
+  BOOL wasShown = _pendingSubstitutionWasShown;
+  if ([self applySubstitution:correction
+                   withString:correction.replacementString
+           ifTextStillMatches:_pendingSubstitutionOriginal] &&
+      wasShown) {
+    [self recordSubstitutionResponse:NSCorrectionResponseAccepted
+                        toCorrection:correction.replacementString
+                             forWord:_pendingSubstitutionOriginal
+                            language:_pendingSubstitutionLanguage];
+  }
   [self clearPendingSubstitution];
 }
 
-// Clears the pending substitution without applying it.
+// Clears the pending substitution without applying it; an offer the user
+// had seen is reported to the checker as ignored.
 - (void)dropPendingSubstitutionUnaccepted {
+  if (_pendingSubstitutionWasShown) {
+    [self recordSubstitutionResponse:NSCorrectionResponseIgnored
+                        toCorrection:_pendingSubstitution.replacementString
+                             forWord:_pendingSubstitutionOriginal
+                            language:_pendingSubstitutionLanguage];
+  }
   [self clearPendingSubstitution];
 }
 

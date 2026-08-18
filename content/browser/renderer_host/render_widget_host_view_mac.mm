@@ -295,6 +295,8 @@ RenderWidgetHostViewMac::RenderWidgetHostViewMac(RenderWidgetHost* widget)
       std::make_unique<remote_cocoa::RenderWidgetHostNSViewBridge>(this, this,
                                                                    ns_view_id_);
   ns_view_ = in_process_ns_view_bridge_.get();
+  ns_view_->SetIsOffTheRecord(
+      host()->GetProcess()->GetBrowserContext()->IsOffTheRecord());
 
   // Guess that the initial screen we will be on is the screen of the current
   // window (since that's the best guess that we have, and is usually right).
@@ -417,6 +419,11 @@ void RenderWidgetHostViewMac::MigrateNSViewBridge(
   if (!is_visible_) {
     remote_ns_view_->SetVisible(false);
   }
+
+  // The profile's off-the-record state was pushed to the previous NSView at
+  // construction; the replacement needs it too.
+  remote_ns_view_->SetIsOffTheRecord(
+      host()->GetProcess()->GetBrowserContext()->IsOffTheRecord());
 
   // Re-send the current text input state to the new NSView bridge. This is
   // necessary because the text input state may have been set before the

@@ -191,6 +191,13 @@
   return NO;
 }
 
+- (void)recordResponse:(NSCorrectionResponse)response
+          toCorrection:(NSString*)correction
+               forWord:(NSString*)word
+              language:(NSString*)language
+    inSpellDocumentWithTag:(NSInteger)tag {
+}
+
 @end
 
 // The indicator is only shown once typing pauses; tests that need an active

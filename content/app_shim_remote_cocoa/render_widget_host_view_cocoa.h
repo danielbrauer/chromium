@@ -59,6 +59,7 @@ CONTENT_EXPORT
 @property(nonatomic, assign) NSRange markedRange;
 @property(nonatomic, assign) ui::TextInputType textInputType;
 @property(nonatomic, assign) int textInputFlags;
+@property(nonatomic, assign) BOOL isOffTheRecord;
 
 @property(nonatomic, strong) NSSpellChecker* spellCheckerForTesting;
 

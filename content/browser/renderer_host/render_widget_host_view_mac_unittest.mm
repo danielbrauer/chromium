@@ -182,6 +182,11 @@ using SpellCheckerCompletionHandlerType = void (
 @property(readonly) NSString* shownPrimaryString;
 @property(readonly) NSUInteger indicatorShowCount;
 @property(readonly) void (^correctionCompletionHandler)(NSString*);
+@property(readonly) NSUInteger recordResponseCount;
+@property(readonly) NSString* lastRecordedLanguage;
+@property(readonly) NSCorrectionResponse lastRecordedResponse;
+@property(readonly) NSString* lastRecordedWord;
+@property(readonly) NSString* lastRecordedCorrection;
 @end
 
 @implementation FakeSpellChecker {
@@ -196,6 +201,11 @@ using SpellCheckerCompletionHandlerType = void (
 @synthesize shownPrimaryString = _shownPrimaryString;
 @synthesize indicatorShowCount = _indicatorShowCount;
 @synthesize correctionCompletionHandler = _correctionCompletionHandler;
+@synthesize recordResponseCount = _recordResponseCount;
+@synthesize lastRecordedLanguage = _lastRecordedLanguage;
+@synthesize lastRecordedResponse = _lastRecordedResponse;
+@synthesize lastRecordedWord = _lastRecordedWord;
+@synthesize lastRecordedCorrection = _lastRecordedCorrection;
 
 - (instancetype)init {
   if (self = [super init]) {
@@ -262,6 +272,17 @@ using SpellCheckerCompletionHandlerType = void (
   }
   if (!(checkingTypes & NSTextCheckingTypeSpelling))
     return results;
+  if (checkingTypes & NSTextCheckingTypeOrthography) {
+    [results addObject:[NSTextCheckingResult
+                           orthographyCheckingResultWithRange:NSMakeRange(
+                                                                  0,
+                                                                  stringToCheck
+                                                                      .length)
+                                                  orthography:
+                                                      [NSOrthography
+                                                          defaultOrthographyForLanguage:
+                                                              @"en"]]];
+  }
   NSRange misspelledRange = [stringToCheck rangeOfString:@"zzz"];
   if (misspelledRange.location != NSNotFound) {
     [results addObject:[NSTextCheckingResult
@@ -291,6 +312,18 @@ using SpellCheckerCompletionHandlerType = void (
 }
 
 - (void)closeSpellDocumentWithTag:(NSInteger)tag {
+}
+
+- (void)recordResponse:(NSCorrectionResponse)response
+          toCorrection:(NSString*)correction
+               forWord:(NSString*)word
+              language:(NSString*)language
+    inSpellDocumentWithTag:(NSInteger)tag {
+  _recordResponseCount++;
+  _lastRecordedResponse = response;
+  _lastRecordedWord = [word copy];
+  _lastRecordedCorrection = [correction copy];
+  _lastRecordedLanguage = [language copy];
 }
 
 - (void)showCorrectionIndicatorOfType:(NSCorrectionIndicatorType)type
@@ -3265,11 +3298,17 @@ TEST_F(SpellingCorrectionTest, ShownIndicatorResolutionAppliesAcceptance) {
   ASSERT_TRUE(spell_checker_.correctionCompletionHandler);
 
   // The user clicks the indicator (or types; AppKit resolves the offer the
-  // same way): the substitution applies on the spot.
+  // same way): the substitution applies on the spot and the acceptance is
+  // recorded with the checker.
   spell_checker_.correctionCompletionHandler(@"the");
   base::RunLoop().RunUntilIdle();
   EXPECT_EQ("CommitText",
             GetMessageNames(host_->GetAndResetDispatchedMessages()));
+  EXPECT_EQ(1u, spell_checker_.recordResponseCount);
+  EXPECT_EQ(NSCorrectionResponseAccepted, spell_checker_.lastRecordedResponse);
+  EXPECT_NSEQ(@"teh", spell_checker_.lastRecordedWord);
+  EXPECT_NSEQ(@"the", spell_checker_.lastRecordedCorrection);
+  EXPECT_NSEQ(@"en", spell_checker_.lastRecordedLanguage);
 
   // A duplicate late resolution must not apply again.
   spell_checker_.correctionCompletionHandler(@"the");
@@ -3280,6 +3319,28 @@ TEST_F(SpellingCorrectionTest, ShownIndicatorResolutionAppliesAcceptance) {
   tab_view()->SelectionChanged(u"the ", 0, gfx::Range(4, 4));
   base::RunLoop().RunUntilIdle();
   EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+}
+
+// Off-the-record typing must leave no trace in the checker's per-user
+// model: the correction still applies, but no response is recorded.
+TEST_F(SpellingCorrectionTest, RecordResponseSuppressedOffTheRecord) {
+  tab_GetInProcessNSView().isOffTheRecord = YES;
+
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  [tab_GetInProcessNSView() showPendingSubstitutionIndicatorNow];
+  base::RunLoop().RunUntilIdle();
+  ASSERT_TRUE(spell_checker_.correctionCompletionHandler);
+
+  spell_checker_.correctionCompletionHandler(@"the");
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("CommitText",
+            GetMessageNames(host_->GetAndResetDispatchedMessages()));
+  EXPECT_EQ(0u, spell_checker_.recordResponseCount);
 }
 
 // The word boundary's own check sees the just-completed word and applies its
@@ -3335,6 +3396,8 @@ TEST_F(SpellingCorrectionTest, BoundaryKeystrokeAcceptsShownOffer) {
 
   EXPECT_EQ("CommitText",
             GetMessageNames(host_->GetAndResetDispatchedMessages()));
+  EXPECT_EQ(1u, spell_checker_.recordResponseCount);
+  EXPECT_EQ(NSCorrectionResponseAccepted, spell_checker_.lastRecordedResponse);
 
   // AppKit's own resolution of the indicator trails in; it must not apply a
   // second time.
@@ -3374,16 +3437,19 @@ TEST_F(SpellingCorrectionTest, PausedOfferNotAcceptedByContinuingKeystroke) {
   host_->GetAndResetDispatchedMessages();
 
   // AppKit's deferred resolution arrives with no identifying current event.
-  // It must not apply.
+  // It must not apply, and nothing is recorded yet.
   spell_checker_.correctionCompletionHandler(@"the");
   base::RunLoop().RunUntilIdle();
   EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+  EXPECT_EQ(0u, spell_checker_.recordResponseCount);
 
-  // The keystroke's text update lands: the word grew, so the offer dies and
-  // nothing is ever applied.
+  // The keystroke's text update lands: the word grew, so the offer dies as
+  // ignored and nothing is ever applied.
   tab_view()->SelectionChanged(u"tehx", 0, gfx::Range(4, 4));
   base::RunLoop().RunUntilIdle();
   EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+  EXPECT_EQ(1u, spell_checker_.recordResponseCount);
+  EXPECT_EQ(NSCorrectionResponseIgnored, spell_checker_.lastRecordedResponse);
 }
 
 // A Return bounds the word just typed exactly as a space does, but arrives
@@ -3415,6 +3481,36 @@ TEST_F(SpellingCorrectionTest, CorrectionAppliedAtReturnBoundary) {
                                    gfx::Range(0, 3), 0, 0,
                                    blink::mojom::ImeState::kNone,
                                    blink::DOMNodeIdType()));
+}
+
+// The insertion point moving away from a visible offer without typing kills
+// the offer, unaccepted; the checker hears "ignored", not "rejected", and
+// the trailing programmatic dismissal is not mistaken for an explicit one.
+TEST_F(SpellingCorrectionTest, ShownOfferIgnoredWhenInsertionPointLeaves) {
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  [tab_GetInProcessNSView() showPendingSubstitutionIndicatorNow];
+  base::RunLoop().RunUntilIdle();
+  ASSERT_EQ(1u, spell_checker_.indicatorShowCount);
+
+  // The user clicks into the middle of the word.
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(1, 1));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+  EXPECT_EQ(1u, spell_checker_.recordResponseCount);
+  EXPECT_EQ(NSCorrectionResponseIgnored, spell_checker_.lastRecordedResponse);
+
+  // The dismissal's completion-handler tail must not be misread as an
+  // explicit rejection.
+  if (spell_checker_.correctionCompletionHandler) {
+    spell_checker_.correctionCompletionHandler(nil);
+    base::RunLoop().RunUntilIdle();
+  }
+  EXPECT_EQ(1u, spell_checker_.recordResponseCount);
 }
 
 // Typing in front of existing content must not turn the pre-existing
@@ -3534,9 +3630,13 @@ TEST_F(SpellingCorrectionTest, HeldCorrectionKilledByExplicitRejection) {
   base::RunLoop().RunUntilIdle();
   ASSERT_TRUE(spell_checker_.correctionCompletionHandler);
 
-  // The user rejects the shown offer.
+  // The user rejects the shown offer; the checker is told.
   spell_checker_.correctionCompletionHandler(nil);
   base::RunLoop().RunUntilIdle();
+  EXPECT_EQ(1u, spell_checker_.recordResponseCount);
+  EXPECT_EQ(NSCorrectionResponseRejected, spell_checker_.lastRecordedResponse);
+  EXPECT_NSEQ(@"teh", spell_checker_.lastRecordedWord);
+  EXPECT_NSEQ(@"the", spell_checker_.lastRecordedCorrection);
 
   tab_view()->SelectionChanged(u"teh ", 0, gfx::Range(4, 4));
   base::RunLoop().RunUntilIdle();

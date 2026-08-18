@@ -233,6 +233,10 @@ void RenderWidgetHostNSViewBridge::SetTextInputState(
   [cocoa_view_ setTextInputFlags:flags];
 }
 
+void RenderWidgetHostNSViewBridge::SetIsOffTheRecord(bool is_off_the_record) {
+  [cocoa_view_ setIsOffTheRecord:is_off_the_record];
+}
+
 void RenderWidgetHostNSViewBridge::SetTextSelection(const std::u16string& text,
                                                     uint64_t offset,
                                                     const gfx::Range& range) {
