@@ -428,6 +428,11 @@ gfx::PointF GetSanitizedFlippedPoint(NSPoint point, CGFloat height) {
   NSString* __strong _rejectedSubstitutionOriginal;
   NSString* __strong _rejectedSubstitutionReplacement;
   NSRange _rejectedSubstitutionRange;
+  NSString* __strong _appliedSubstitutionOriginal;
+  NSString* __strong _appliedSubstitutionReplacement;
+  NSString* __strong _appliedSubstitutionLanguage;
+  NSRange _appliedSubstitutionRange;
+  BOOL _appliedSubstitutionRevertRecorded;
   NSUInteger _keyEventCount;
   NSUInteger _keyEventCountAtIndicatorShow;
   NSUInteger _pendingTextSubstitutionChecks;
@@ -617,6 +622,25 @@ static NSWindow* __weak _deferredResignKeyWindow;
       [_rejectedSubstitutionReplacement
           isEqualToString:candidate.replacementString] &&
       NSEqualRanges(_rejectedSubstitutionRange, candidate.range)) {
+    return;
+  }
+  // Neither is a correction the user manually backed out: the same word in
+  // the same place drawing the same correction after an apply means the
+  // user restored their word, and re-offering it would fight them. The
+  // first re-sighting is the undo itself — record it as Reverted, the
+  // response native text views record when a correction is backed out.
+  if ([_appliedSubstitutionOriginal isEqualToString:originalString] &&
+      [_appliedSubstitutionReplacement
+          isEqualToString:candidate.replacementString] &&
+      NSIntersectionRange(_appliedSubstitutionRange, candidate.range).length >
+          0) {
+    if (!_appliedSubstitutionRevertRecorded) {
+      _appliedSubstitutionRevertRecorded = YES;
+      [self recordSubstitutionResponse:NSCorrectionResponseReverted
+                          toCorrection:candidate.replacementString
+                               forWord:originalString
+                              language:_appliedSubstitutionLanguage ?: language];
+    }
     return;
   }
   // A fresh result for the same word and replacement is the same offer; it
@@ -830,6 +854,15 @@ static NSWindow* __weak _deferredResignKeyWindow;
   if (![currentString isEqualToString:originalString])
     return NO;
   _substitutionWasApplied = YES;
+  // Remembered so that a user who edits the correction back to their word
+  // is not corrected again (and the undo is recorded as Reverted); see
+  // -parkSubstitutionCandidate:inText:language:.
+  _appliedSubstitutionOriginal = [originalString copy];
+  _appliedSubstitutionReplacement = [replacement copy];
+  _appliedSubstitutionLanguage = [_pendingSubstitutionLanguage copy];
+  _appliedSubstitutionRange =
+      NSMakeRange(correction.range.location, replacement.length);
+  _appliedSubstitutionRevertRecorded = NO;
   [self insertText:replacement replacementRange:correction.range];
   return YES;
 }

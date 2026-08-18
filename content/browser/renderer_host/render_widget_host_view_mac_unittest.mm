@@ -3343,6 +3343,49 @@ TEST_F(SpellingCorrectionTest, RecordResponseSuppressedOffTheRecord) {
   EXPECT_EQ(0u, spell_checker_.recordResponseCount);
 }
 
+// A correction the user manually backed out is not offered or applied
+// again for that word instance: re-correcting a word the user has already
+// un-corrected once means fighting the user. The first re-sighting records
+// Reverted — the response native text views record when a correction is
+// backed out — and later re-sightings stay silent without recording again.
+TEST_F(SpellingCorrectionTest, RevertedCorrectionNotReappliedOrReoffered) {
+  // A completed word with its boundary: the correction applies silently.
+  tab_view()->SelectionChanged(u"teh ", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  ASSERT_EQ("CommitText",
+            GetMessageNames(host_->GetAndResetDispatchedMessages()));
+  EXPECT_EQ(0u, spell_checker_.recordResponseCount);
+
+  // The renderer echoes the corrected text back.
+  tab_view()->SelectionChanged(u"the ", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+
+  // The user restores their word (selects the correction, retypes) and the
+  // caret ends up past the boundary again. The checker proposes the same
+  // correction; it must not reapply, and the manual undo reaches the
+  // checker as Reverted.
+  tab_view()->SelectionChanged(u"teh ", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+  EXPECT_EQ(1u, spell_checker_.recordResponseCount);
+  EXPECT_EQ(NSCorrectionResponseReverted, spell_checker_.lastRecordedResponse);
+  EXPECT_NSEQ(@"teh", spell_checker_.lastRecordedWord);
+  EXPECT_NSEQ(@"the", spell_checker_.lastRecordedCorrection);
+
+  // Later checks that see the same word keep declining, without recording
+  // a second response.
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+  EXPECT_EQ(1u, spell_checker_.recordResponseCount);
+}
+
 // The word boundary's own check sees the just-completed word and applies its
 // correction even when no earlier check saw the word being typed — the case
 // where the word's last character and the boundary arrive in one coalesced
