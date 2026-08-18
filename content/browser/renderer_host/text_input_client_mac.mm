@@ -273,11 +273,21 @@ void TextInputClientMac::AsyncRequest(
           .Then(std::move(result_callback)));
 
   const RequestToken request_token;
-  auto [it, inserted] = async_requests_.emplace(
-      request_token, AsyncRequestData(std::move(success_callback)));
+  const bool inserted =
+      async_requests_
+          .emplace(request_token, AsyncRequestData(std::move(success_callback)))
+          .second;
   CHECK(inserted);
 
   async_request_delegate_->SendRequest(rfhi.get(), request_token, params);
+
+  // The delegate may complete the request synchronously from inside
+  // SendRequest (test delegates answer while the lock is held), which erases
+  // the request's entry; look it up again before arming the timeout.
+  const auto it = async_requests_.find(request_token);
+  if (it == async_requests_.end()) {
+    return;
+  }
 
   it->second.timer->Start(
       FROM_HERE, wait_timeout_,
