@@ -277,6 +277,16 @@ using SpellCheckerCompletionHandlerType = void (
                       correctionCheckingResultWithRange:correctableRange
                                       replacementString:@"the"]];
   }
+  // A capitalization correction: same result type, case-only difference, no
+  // accompanying spelling marker (the original is not misspelled).
+  NSRange capitalizableRange = [stringToCheck rangeOfString:@"reci"];
+  if (capitalizableRange.location != NSNotFound &&
+      (checkingTypes & NSTextCheckingTypeCorrection)) {
+    [results
+        addObject:[NSTextCheckingResult
+                      correctionCheckingResultWithRange:capitalizableRange
+                                      replacementString:@"Reci"]];
+  }
   return results;
 }
 
@@ -2687,9 +2697,8 @@ class TextSubstitutionTest : public InputMethodMacTest {
   }
 
   void TearDown() override {
-    // Cancel any indicator show still scheduled behind the typing-pause
-    // delay so it cannot fire into a later test.
-    [NSObject cancelPreviousPerformRequestsWithTarget:tab_GetInProcessNSView()];
+    // Any indicator show still scheduled behind the typing-pause delay dies
+    // with the view's timer; nothing can fire into a later test.
     TextInputClientMac::GetInstance()->SetAsyncRequestDelegateForTesting(
         nullptr);
     InputMethodMacTest::TearDown();
@@ -2879,6 +2888,11 @@ TEST_F(TextSubstitutionTest, TextSubstitutionClickOnIndicatorApplies) {
 
   [tab_GetInProcessNSView() requestTextSubstitutions];
   base::RunLoop().RunUntilIdle();
+
+  // The indicator appears once typing pauses (driven directly here rather
+  // than waiting out the pause timer).
+  [tab_GetInProcessNSView() showPendingSubstitutionIndicatorNow];
+  base::RunLoop().RunUntilIdle();
   EXPECT_EQ(1u, spell_checker_.indicatorShowCount);
   EXPECT_NSEQ(@"On my way!", spell_checker_.shownPrimaryString);
   EXPECT_EQ(NSCorrectionIndicatorTypeDefault, spell_checker_.shownIndicatorType);
@@ -2907,6 +2921,11 @@ TEST_F(TextSubstitutionTest, TextSubstitutionEscapeDropsOffer) {
   host_->GetAndResetDispatchedMessages();
 
   [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+
+  // The indicator appears once typing pauses (driven directly here rather
+  // than waiting out the pause timer).
+  [tab_GetInProcessNSView() showPendingSubstitutionIndicatorNow];
   base::RunLoop().RunUntilIdle();
   EXPECT_EQ(1u, spell_checker_.indicatorShowCount);
 
@@ -3007,6 +3026,11 @@ TEST_F(TextSubstitutionTest, TextSubstitutionOfferedWhenUpdatesLagTyping) {
   tab_view()->SelectionChanged(u"omw", 0, gfx::Range(3, 3));
   base::RunLoop().RunUntilIdle();
   host_->GetAndResetDispatchedMessages();
+
+  // The check ran and parked the offer; the indicator appears once typing
+  // pauses (driven directly here rather than waiting out the pause timer).
+  [tab_GetInProcessNSView() showPendingSubstitutionIndicatorNow];
+  base::RunLoop().RunUntilIdle();
   EXPECT_EQ(1u, spell_checker_.indicatorShowCount);
   ASSERT_TRUE(spell_checker_.correctionCompletionHandler);
 
@@ -3097,8 +3121,9 @@ TEST_F(InputMethodMacTest, AllowedTextCheckingTypesRespectsAutocorrectOff) {
   EXPECT_EQ(0, tab_GetInProcessNSView().allowedTextCheckingTypes);
 }
 
-// End-to-end within the browser process: typing a misspelled word offers a
-// correction through the AppKit indicator, and accepting it replaces the word.
+// End-to-end within the browser process: typing a misspelled word parks a
+// correction, which applies when the word boundary arrives. No indicator is
+// involved in application, and none is shown at typing speed.
 TEST_F(SpellingCorrectionTest, CorrectionOfferedAndApplied) {
   // The user has typed "teh", with the insertion point after it.
   tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
@@ -3117,17 +3142,466 @@ TEST_F(SpellingCorrectionTest, CorrectionOfferedAndApplied) {
   EXPECT_TRUE(spell_checker_.lastRequestedCheckingTypes &
               NSTextCheckingTypeOrthography);
   EXPECT_NE(0, spell_checker_.lastSpellDocumentTag);
-  EXPECT_NSEQ(@"the", spell_checker_.shownPrimaryString);
-  EXPECT_EQ(NSCorrectionIndicatorTypeDefault, spell_checker_.shownIndicatorType);
-  ASSERT_TRUE(spell_checker_.correctionCompletionHandler);
 
-  // AppKit reports that the user accepted the correction.
-  spell_checker_.correctionCompletionHandler(@"the");
+  // No bubble at typing speed, and nothing applied yet.
+  EXPECT_EQ(0u, spell_checker_.indicatorShowCount);
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  // The user types a space: the boundary arrives and the held substitution
+  // applies.
+  tab_view()->SelectionChanged(u"teh ", 0, gfx::Range(4, 4));
   base::RunLoop().RunUntilIdle();
 
   MockWidgetInputHandler::MessageVector events =
       host_->GetAndResetDispatchedMessages();
   EXPECT_EQ("CommitText", GetMessageNames(events));
+}
+
+// A held substitution must not apply if the user goes on typing word
+// characters — the word it was computed for no longer exists.
+TEST_F(SpellingCorrectionTest, CorrectionNotAppliedWhenWordContinues) {
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  // The word keeps growing: the held substitution must be dropped, both now
+  // and when a boundary arrives later.
+  tab_view()->SelectionChanged(u"tehq", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  tab_view()->SelectionChanged(u"tehq ", 0, gfx::Range(5, 5));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  // The pause-show declines: nothing is held anymore.
+  [tab_GetInProcessNSView() showPendingSubstitutionIndicatorNow];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ(0u, spell_checker_.indicatorShowCount);
+}
+
+// A held substitution dies when the insertion point leaves the end of the
+// word: its context is gone, and a boundary typed later must not resurrect
+// it.
+TEST_F(SpellingCorrectionTest, CorrectionDroppedWhenInsertionPointLeaves) {
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  // The user clicks back into the middle of the word.
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(1, 1));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  // Even though a boundary now exists at the word's end, the dropped
+  // acceptance stays dropped.
+  tab_view()->SelectionChanged(u"teh ", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+}
+
+// The indicator is shown only when typing pauses with a candidate held,
+// and only once per held candidate.
+TEST_F(SpellingCorrectionTest, CorrectionIndicatorShownOnPause) {
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ(0u, spell_checker_.indicatorShowCount);
+
+  // The pause timer fires (driven directly; the real timer needs the run
+  // loop).
+  [tab_GetInProcessNSView() showPendingSubstitutionIndicatorNow];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ(1u, spell_checker_.indicatorShowCount);
+  EXPECT_NSEQ(@"the", spell_checker_.shownPrimaryString);
+  EXPECT_EQ(NSCorrectionIndicatorTypeDefault, spell_checker_.shownIndicatorType);
+
+  // Firing again for the same held candidate does not re-show.
+  [tab_GetInProcessNSView() showPendingSubstitutionIndicatorNow];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ(1u, spell_checker_.indicatorShowCount);
+}
+
+// The pacing kill switch: with kMacSubstitutionOfferPacing disabled, a
+// parked offer shows immediately from the check, no pause required —
+// the indicator cadence pacing replaces.
+TEST_F(SpellingCorrectionTest, IndicatorShownImmediatelyWithPacingDisabled) {
+  base::test::ScopedFeatureList feature_list;
+  feature_list.InitAndDisableFeature(features::kMacSubstitutionOfferPacing);
+
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ(1u, spell_checker_.indicatorShowCount);
+  EXPECT_NSEQ(@"the", spell_checker_.shownPrimaryString);
+}
+
+// Once the indicator has been shown — which only happens after a pause in
+// typing — a resolution carrying a string with no key event since the show
+// is a click on the indicator, and applies immediately, exactly once.
+TEST_F(SpellingCorrectionTest, ShownIndicatorResolutionAppliesAcceptance) {
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  [tab_GetInProcessNSView() showPendingSubstitutionIndicatorNow];
+  base::RunLoop().RunUntilIdle();
+  ASSERT_TRUE(spell_checker_.correctionCompletionHandler);
+
+  // The user clicks the indicator (or types; AppKit resolves the offer the
+  // same way): the substitution applies on the spot.
+  spell_checker_.correctionCompletionHandler(@"the");
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("CommitText",
+            GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  // A duplicate late resolution must not apply again.
+  spell_checker_.correctionCompletionHandler(@"the");
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  // Neither must the boundary, once the applied text comes back.
+  tab_view()->SelectionChanged(u"the ", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+}
+
+// The word boundary's own check sees the just-completed word and applies its
+// correction even when no earlier check saw the word being typed — the case
+// where the word's last character and the boundary arrive in one coalesced
+// text update.
+TEST_F(SpellingCorrectionTest, CorrectionAppliedFromFreshCheckAtBoundary) {
+  // The first state the view ever sees already contains the boundary.
+  tab_view()->SelectionChanged(u"teh ", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+
+  MockWidgetInputHandler::MessageVector events =
+      host_->GetAndResetDispatchedMessages();
+  ASSERT_EQ("CommitText", GetMessageNames(events));
+  MockWidgetInputHandler::DispatchedIMEMessage* ime_message =
+      events[0]->ToIME();
+  ASSERT_TRUE(ime_message);
+  EXPECT_TRUE(ime_message->Matches(u"the", std::vector<ui::ImeTextSpan>(),
+                                   gfx::Range(0, 3), 0, 0,
+                                   blink::mojom::ImeState::kNone,
+                                   blink::DOMNodeIdType()));
+}
+
+// A boundary keystroke arriving while the indicator is up accepts the offer
+// (typing a word character instead kills it — this view's offer stream
+// contains mid-word noise that native machinery would withhold, so only the
+// boundary or a click accepts).
+TEST_F(SpellingCorrectionTest, BoundaryKeystrokeAcceptsShownOffer) {
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  [tab_GetInProcessNSView() showPendingSubstitutionIndicatorNow];
+  base::RunLoop().RunUntilIdle();
+  ASSERT_EQ(1u, spell_checker_.indicatorShowCount);
+
+  // The user types the boundary keystroke; its text update arrives before
+  // AppKit's resolution of the indicator does. The real key event marks the
+  // update as following typing via -insertText:replacementRange:.
+  [tab_GetInProcessNSView()
+      keyEvent:cocoa_test_event_utils::KeyEventWithKeyCode(
+                   0x31, ' ', NSEventTypeKeyDown, 0)];
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+  tab_view()->SelectionChanged(u"teh ", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+
+  EXPECT_EQ("CommitText",
+            GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  // AppKit's own resolution of the indicator trails in; it must not apply a
+  // second time.
+  if (spell_checker_.correctionCompletionHandler) {
+    spell_checker_.correctionCompletionHandler(@"the");
+    base::RunLoop().RunUntilIdle();
+    EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+  }
+}
+
+// Regression test for the pause-then-continue misapply: an offer shown on
+// pause must not apply when the next keystroke continues the word. AppKit
+// resolves a shown indicator as "accepted" on any key event and may deliver
+// that resolution asynchronously, after the event's dispatch — when
+// NSApp.currentEvent no longer identifies the cause. The view's key-event
+// ledger still does: a resolution arriving after a key event passed through
+// the view defers to text arbitration, which drops the offer when the word
+// grows.
+TEST_F(SpellingCorrectionTest, PausedOfferNotAcceptedByContinuingKeystroke) {
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  [tab_GetInProcessNSView() showPendingSubstitutionIndicatorNow];
+  base::RunLoop().RunUntilIdle();
+  ASSERT_EQ(1u, spell_checker_.indicatorShowCount);
+  ASSERT_TRUE(spell_checker_.correctionCompletionHandler);
+
+  // The user types a word character. The key event passes through the view
+  // ahead of AppKit's deferred resolution of the indicator.
+  [tab_GetInProcessNSView()
+      keyEvent:cocoa_test_event_utils::KeyEventWithKeyCode(
+                   0x07, 'x', NSEventTypeKeyDown, 0)];
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  // AppKit's deferred resolution arrives with no identifying current event.
+  // It must not apply.
+  spell_checker_.correctionCompletionHandler(@"the");
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  // The keystroke's text update lands: the word grew, so the offer dies and
+  // nothing is ever applied.
+  tab_view()->SelectionChanged(u"tehx", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+}
+
+// A Return bounds the word just typed exactly as a space does, but arrives
+// via -doCommandBySelector: rather than -insertText:. Its text update must
+// still run a substitution check, so a correction discovered only at the
+// boundary applies.
+TEST_F(SpellingCorrectionTest, CorrectionAppliedAtReturnBoundary) {
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  // Return; kVK_Return is 0x24.
+  [tab_GetInProcessNSView()
+      keyEvent:cocoa_test_event_utils::KeyEventWithKeyCode(
+                   0x24, '\r', NSEventTypeKeyDown, 0)];
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  tab_view()->SelectionChanged(u"teh\n", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+
+  MockWidgetInputHandler::MessageVector events =
+      host_->GetAndResetDispatchedMessages();
+  ASSERT_EQ("CommitText", GetMessageNames(events));
+  MockWidgetInputHandler::DispatchedIMEMessage* ime_message =
+      events[0]->ToIME();
+  ASSERT_TRUE(ime_message);
+  EXPECT_TRUE(ime_message->Matches(u"the", std::vector<ui::ImeTextSpan>(),
+                                   gfx::Range(0, 3), 0, 0,
+                                   blink::mojom::ImeState::kNone,
+                                   blink::DOMNodeIdType()));
+}
+
+// Typing in front of existing content must not turn the pre-existing
+// trailing text into an accept signal: a substitution applies only when the
+// user's own keystroke lands a boundary character directly behind the word,
+// never while the insertion point still sits at the word's end.
+TEST_F(SpellingCorrectionTest, CorrectionHeldWhileTypingBeforeExistingText) {
+  // The word under the insertion point is followed by pre-existing text.
+  tab_view()->SelectionChanged(u"teh and more", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  // Held, not applied: the boundary in the text is not the user's.
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  // The user's next keystroke is a space: now the boundary is theirs, and
+  // the substitution applies.
+  tab_view()->SelectionChanged(u"teh  and more", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+
+  MockWidgetInputHandler::MessageVector events =
+      host_->GetAndResetDispatchedMessages();
+  ASSERT_EQ("CommitText", GetMessageNames(events));
+  MockWidgetInputHandler::DispatchedIMEMessage* ime_message =
+      events[0]->ToIME();
+  ASSERT_TRUE(ime_message);
+  EXPECT_TRUE(ime_message->Matches(u"the", std::vector<ui::ImeTextSpan>(),
+                                   gfx::Range(0, 3), 0, 0,
+                                   blink::mojom::ImeState::kNone,
+                                   blink::DOMNodeIdType()));
+}
+
+// Continuing the word in front of existing text drops the held candidate —
+// the word grew, so the offer no longer describes it.
+TEST_F(SpellingCorrectionTest, CorrectionDroppedOnGrowthBeforeExistingText) {
+  tab_view()->SelectionChanged(u"teh and more", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  // The user types a word character instead of a boundary.
+  tab_view()->SelectionChanged(u"tehx and more", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  // A boundary typed later must not resurrect the dropped candidate.
+  tab_view()->SelectionChanged(u"tehx  and more", 0, gfx::Range(5, 5));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+}
+
+// Capitalization corrections ride the correction result type as a case-only
+// difference with no accompanying spelling marker; they travel the same
+// offer/apply path as spelling corrections. The two tests below mirror
+// CorrectionOfferedAndApplied and CorrectionIndicatorShownOnPause for that
+// result shape.
+TEST_F(SpellingCorrectionTest, CapitalizationOfferedAndApplied) {
+  tab_view()->SelectionChanged(u"reci", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+
+  // No bubble at typing speed, and nothing applied yet.
+  EXPECT_EQ(0u, spell_checker_.indicatorShowCount);
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  tab_view()->SelectionChanged(u"reci ", 0, gfx::Range(5, 5));
+  base::RunLoop().RunUntilIdle();
+
+  MockWidgetInputHandler::MessageVector events =
+      host_->GetAndResetDispatchedMessages();
+  ASSERT_EQ("CommitText", GetMessageNames(events));
+  MockWidgetInputHandler::DispatchedIMEMessage* ime_message =
+      events[0]->ToIME();
+  ASSERT_TRUE(ime_message);
+  EXPECT_TRUE(ime_message->Matches(u"Reci", std::vector<ui::ImeTextSpan>(),
+                                   gfx::Range(0, 4), 0, 0,
+                                   blink::mojom::ImeState::kNone,
+                                   blink::DOMNodeIdType()));
+}
+
+TEST_F(SpellingCorrectionTest, CapitalizationOfferShownOnPause) {
+  tab_view()->SelectionChanged(u"reci", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ(0u, spell_checker_.indicatorShowCount);
+
+  // The pause timer fires (driven directly; the real timer needs the run
+  // loop).
+  [tab_GetInProcessNSView() showPendingSubstitutionIndicatorNow];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ(1u, spell_checker_.indicatorShowCount);
+  EXPECT_NSEQ(@"Reci", spell_checker_.shownPrimaryString);
+  EXPECT_EQ(NSCorrectionIndicatorTypeDefault, spell_checker_.shownIndicatorType);
+}
+
+// An explicit rejection — Escape or the indicator's dismiss control — kills
+// the held substitution; a boundary typed afterwards must not apply it.
+TEST_F(SpellingCorrectionTest, HeldCorrectionKilledByExplicitRejection) {
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  [tab_GetInProcessNSView() showPendingSubstitutionIndicatorNow];
+  base::RunLoop().RunUntilIdle();
+  ASSERT_TRUE(spell_checker_.correctionCompletionHandler);
+
+  // The user rejects the shown offer.
+  spell_checker_.correctionCompletionHandler(nil);
+  base::RunLoop().RunUntilIdle();
+
+  tab_view()->SelectionChanged(u"teh ", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+
+  // The same offer for the same word is never made again: retyping the word
+  // parks nothing, shows nothing, and the boundary applies nothing (WebKit:
+  // the RejectedCorrection document marker).
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  [tab_GetInProcessNSView() showPendingSubstitutionIndicatorNow];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ(1u, spell_checker_.indicatorShowCount);
+  tab_view()->SelectionChanged(u"teh ", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("", GetMessageNames(host_->GetAndResetDispatchedMessages()));
+}
+
+// The rejection memory is scoped to the word instance the user rejected:
+// deleting that word and typing it afresh earns a fresh offer, as it does
+// in Safari, where the rejection marker dies with the deleted text.
+TEST_F(SpellingCorrectionTest, RejectedOfferReturnsWhenWordRetyped) {
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  [tab_GetInProcessNSView() showPendingSubstitutionIndicatorNow];
+  base::RunLoop().RunUntilIdle();
+  ASSERT_TRUE(spell_checker_.correctionCompletionHandler);
+
+  // The user rejects the shown offer.
+  spell_checker_.correctionCompletionHandler(nil);
+  base::RunLoop().RunUntilIdle();
+
+  // While the rejected word sits untouched, the offer stays dead.
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  [tab_GetInProcessNSView() showPendingSubstitutionIndicatorNow];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ(1u, spell_checker_.indicatorShowCount);
+
+  // The user deletes the word entirely: the instance the rejection named is
+  // gone, and the memory dies with it.
+  tab_view()->SelectionChanged(u"", 0, gfx::Range(0, 0));
+  base::RunLoop().RunUntilIdle();
+
+  // Retyping the word is a fresh instance: it offers again...
+  tab_view()->SelectionChanged(u"teh", 0, gfx::Range(3, 3));
+  base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
+  [tab_GetInProcessNSView() requestTextSubstitutions];
+  base::RunLoop().RunUntilIdle();
+  [tab_GetInProcessNSView() showPendingSubstitutionIndicatorNow];
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ(2u, spell_checker_.indicatorShowCount);
+
+  // ...and the boundary applies it.
+  tab_view()->SelectionChanged(u"teh ", 0, gfx::Range(4, 4));
+  base::RunLoop().RunUntilIdle();
+  EXPECT_EQ("CommitText",
+            GetMessageNames(host_->GetAndResetDispatchedMessages()));
 }
 
 // The spell checker is asked about a range within the available text, but the
@@ -3144,13 +3618,13 @@ TEST_F(SpellingCorrectionTest, CorrectionRangeIsInDocumentCoordinates) {
   base::RunLoop().RunUntilIdle();
   host_->GetAndResetDispatchedMessages();
 
+  // The checker sees the word at its position within the window; the parked
+  // substitution is held until the boundary arrives.
   [tab_GetInProcessNSView() requestTextSubstitutions];
   base::RunLoop().RunUntilIdle();
+  host_->GetAndResetDispatchedMessages();
 
-  // The checker sees the word at its position within the window...
-  ASSERT_TRUE(spell_checker_.correctionCompletionHandler);
-
-  spell_checker_.correctionCompletionHandler(@"the");
+  tab_view()->SelectionChanged(u"teh ", kOffset, gfx::Range(104, 104));
   base::RunLoop().RunUntilIdle();
 
   // ...but the correction is applied at its position in the document. Had it

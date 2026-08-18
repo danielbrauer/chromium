@@ -21,6 +21,7 @@
 #include "base/numerics/safe_conversions.h"
 #include "base/strings/string_util.h"
 #include "base/strings/sys_string_conversions.h"
+#include "base/timer/timer.h"
 #include "base/trace_event/trace_event.h"
 #include "components/input/web_input_event_builders_mac.h"
 #include "components/remote_cocoa/app_shim/ns_view_ids.h"
@@ -83,6 +84,10 @@ constexpr NSString* const WebAutomaticTextReplacementEnabled =
     @"WebAutomaticTextReplacementEnabled";
 constexpr NSString* const WebAutomaticSpellingCorrectionEnabled =
     @"WebAutomaticSpellingCorrectionEnabled";
+
+// How long typing must pause before a held substitution offer is shown.
+// WebKit's correctionPanelTimerInterval.
+constexpr base::TimeDelta kSubstitutionIndicatorPause = base::Milliseconds(300);
 
 // Cap on typed insertions still owing a substitution check, in case their
 // text updates never arrive; a stale check is harmless, an unbounded count
@@ -418,9 +423,13 @@ gfx::PointF GetSanitizedFlippedPoint(NSPoint point, CGFloat height) {
   NSString* __strong _pendingSubstitutionOriginal;
   NSTextCheckingResult* __strong _shownSubstitution;
   NSString* __strong _shownSubstitutionOriginal;
+  NSString* __strong _rejectedSubstitutionOriginal;
+  NSString* __strong _rejectedSubstitutionReplacement;
+  NSRange _rejectedSubstitutionRange;
   NSUInteger _keyEventCount;
   NSUInteger _keyEventCountAtIndicatorShow;
   NSUInteger _pendingTextSubstitutionChecks;
+  base::OneShotTimer _substitutionIndicatorPauseTimer;
   BOOL _substitutionWasApplied;
   bool _sonomaAccessibilityRefinementsAreActive;
   std::unique_ptr<content::ScopedAccessibilityMode> _basic_accessibility_mode;
@@ -574,7 +583,7 @@ static NSWindow* __weak _deferredResignKeyWindow;
                            inText:availableText];
   [self resolvePendingSubstitution];
   if (_pendingSubstitution)
-    [self showPendingSubstitutionIndicatorNow];
+    [self scheduleSubstitutionIndicatorAfterPause];
 }
 
 // Parks `candidate` as the pending substitution, with the text it was
@@ -590,8 +599,39 @@ static NSWindow* __weak _deferredResignKeyWindow;
       candidate.range.location - _availableTextOffset, candidate.range.length);
   NSString* originalString =
       [availableText substringWithRange:rangeInAvailableText];
+  // The most recently rejected offer is not made again while the rejected
+  // word instance survives; a fresh instance of the same word elsewhere
+  // offers normally.
+  if ([_rejectedSubstitutionOriginal isEqualToString:originalString] &&
+      [_rejectedSubstitutionReplacement
+          isEqualToString:candidate.replacementString] &&
+      NSEqualRanges(_rejectedSubstitutionRange, candidate.range)) {
+    return;
+  }
   _pendingSubstitution = candidate;
   _pendingSubstitutionOriginal = originalString;
+}
+
+- (void)scheduleSubstitutionIndicatorAfterPause {
+  // Kill switch for the pacing delta: disabled, every parked offer shows
+  // immediately, the indicator cadence this change replaces. Acceptance
+  // arbitration is unaffected either way.
+  if (!base::FeatureList::IsEnabled(
+          features::kMacSubstitutionOfferPacing)) {
+    [self showPendingSubstitutionIndicatorNow];
+    return;
+  }
+  // Show the indicator only when typing pauses with a candidate still held;
+  // at typing speed substitutions apply silently at the word boundary. Each
+  // keystroke's check restarts the timer;
+  // -showPendingSubstitutionIndicatorNow re-validates the offer when it
+  // fires. The timer dies with this view, so the callback's weak self is
+  // never stale, only possibly nil.
+  __weak RenderWidgetHostViewCocoa* weakSelf = self;
+  _substitutionIndicatorPauseTimer.Start(
+      FROM_HERE, kSubstitutionIndicatorPause, base::BindOnce(^{
+        [weakSelf showPendingSubstitutionIndicatorNow];
+      }));
 }
 
 - (void)showPendingSubstitutionIndicatorNow {
@@ -719,7 +759,11 @@ static NSWindow* __weak _deferredResignKeyWindow;
 
   if (offerWasCurrent) {
     // AppKit resolved with no replacement on its own: Escape, or the
-    // indicator's dismiss control. An explicit rejection kills the offer.
+    // indicator's dismiss control. An explicit rejection kills the offer
+    // and is remembered so it is not immediately re-offered.
+    _rejectedSubstitutionOriginal = originalString;
+    _rejectedSubstitutionReplacement = correction.replacementString;
+    _rejectedSubstitutionRange = correction.range;
     [self clearPendingSubstitution];
     return;
   }
@@ -1004,6 +1048,26 @@ static NSWindow* __weak _deferredResignKeyWindow;
   _availableTextChangeCounter++;
   _textSelectionRange = range;
   _substitutionWasApplied = NO;
+
+  // The rejected-offer memory names a word instance; it holds only while
+  // that word still sits at its range, and clears when the text there
+  // changes or leaves the window. Deleting and retyping the word earns a
+  // fresh offer, as it does in Safari, where the rejection marker dies with
+  // the text that carries it.
+  if (_rejectedSubstitutionOriginal) {
+    NSString* availableText = base::SysUTF16ToNSString(_availableText);
+    NSRange rangeInAvailableText =
+        NSMakeRange(_rejectedSubstitutionRange.location - offset,
+                    _rejectedSubstitutionRange.length);
+    if (_rejectedSubstitutionRange.location < offset ||
+        NSMaxRange(rangeInAvailableText) > availableText.length ||
+        ![[availableText substringWithRange:rangeInAvailableText]
+            isEqualToString:_rejectedSubstitutionOriginal]) {
+      _rejectedSubstitutionOriginal = nil;
+      _rejectedSubstitutionReplacement = nil;
+      _rejectedSubstitutionRange = NSMakeRange(NSNotFound, 0);
+    }
+  }
 
   // Continuing the word rejects a visible offer; a boundary keystroke or a
   // click on the indicator accepts it. Deliberately more conservative than
@@ -3002,6 +3066,15 @@ extern NSString* NSTextInputReplacementRangeAttributeName;
       }
     }
     _hasEditCommands = YES;
+    // A newline or tab bounds the word just typed exactly as a space does,
+    // but arrives here rather than through -insertText:; its text update
+    // owes a substitution check all the same (see -insertText:).
+    if (command == "insertNewline" || command == "insertParagraphSeparator" ||
+        command == "insertLineBreak" || command == "insertTab") {
+      if (_pendingTextSubstitutionChecks < 16) {
+        _pendingTextSubstitutionChecks++;
+      }
+    }
     // We ignore commands that insert characters, because this was causing
     // strange behavior (e.g. tab always inserted a tab rather than moving to
     // the next field on the page).

@@ -155,6 +155,13 @@ BASE_FEATURE(kCancelCompositionWhenWindowLosesFocus,
 BASE_FEATURE(kMacAutomaticSpellingCorrection,
              base::FEATURE_DISABLED_BY_DEFAULT);
 
+// Kill switch for pacing macOS substitution offers: the correction
+// indicator is shown only when typing pauses with an offer held, instead of
+// immediately for every offer. Disabling restores the immediate-show
+// cadence; acceptance arbitration is unaffected.
+BASE_FEATURE(kMacSubstitutionOfferPacing,
+             base::FEATURE_ENABLED_BY_DEFAULT);
+
 // Kill switch for arbitrating macOS substitution acceptance by text state:
 // enabled, an indicator resolution caused by a key event defers to the text
 // arbitration, and a held offer applies silently when the user's keystroke

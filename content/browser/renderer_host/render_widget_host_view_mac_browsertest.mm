@@ -193,6 +193,12 @@
 
 @end
 
+// The indicator is only shown once typing pauses; tests that need an active
+// indicator drive the pause-show directly instead of waiting out the timer.
+@interface RenderWidgetHostViewCocoa (SubstitutionTesting)
+- (void)showPendingSubstitutionIndicatorNow;
+@end
+
 namespace content {
 
 namespace {
@@ -486,10 +492,14 @@ IN_PROC_BROWSER_TEST_F(RenderWidgetHostViewMacTest,
       EvalJs(shell(), "editor.editContext.text").ExtractString();
   EXPECT_EQ("omw", current_value);
 
-  // For active text replacement suggestion, the completion handler should be
-  // set.
-  EXPECT_TRUE(fakeSpellChecker.correctionCompletionHandler != nil)
-      << "showCorrectionIndicatorOfType should be called";
+  // An active text replacement suggestion is held; the indicator appears
+  // once typing pauses (driven directly here rather than waiting out the
+  // pause timer).
+  [rwhv_cocoa showPendingSubstitutionIndicatorNow];
+  // The show completes asynchronously, after the layout rect query's reply.
+  EXPECT_TRUE(base::test::RunUntil([&]() {
+    return fakeSpellChecker.correctionCompletionHandler != nil;
+  })) << "showCorrectionIndicatorOfType should be called";
 
   TextSelectionWaiter selection_waiter(rwhv_mac);
   NSEvent* backspaceDownEvent = cocoa_test_event_utils::KeyEventWithKeyCode(
@@ -563,10 +573,14 @@ IN_PROC_BROWSER_TEST_F(RenderWidgetHostViewMacTest,
   std::string text = EvalJs(shell(), "editor.editContext.text").ExtractString();
   EXPECT_EQ("omw", text);
 
-  // For active text replacement suggestion, the completion handler should be
-  // set.
-  EXPECT_TRUE(fakeSpellChecker.correctionCompletionHandler != nil)
-      << "showCorrectionIndicatorOfType should be called";
+  // An active text replacement suggestion is held; the indicator appears
+  // once typing pauses (driven directly here rather than waiting out the
+  // pause timer).
+  [rwhv_cocoa showPendingSubstitutionIndicatorNow];
+  // The show completes asynchronously, after the layout rect query's reply.
+  EXPECT_TRUE(base::test::RunUntil([&]() {
+    return fakeSpellChecker.correctionCompletionHandler != nil;
+  })) << "showCorrectionIndicatorOfType should be called";
 
   // Wait for any pending DOM update or selection sync to complete between
   // browser and renderer process.
