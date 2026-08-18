@@ -257,6 +257,15 @@ interface RenderWidgetHostNSViewHost {
            gfx.mojom.Range out_actual_range,
            bool success);
 
+  // Like SyncGetFirstRectForRange, but asynchronous, and always answered from
+  // the renderer's layout instead of the browser's IME caches, which may
+  // approximate the rectangle of a range with the caret's. Used to anchor the
+  // correction indicator, which must align with a specific word. If there was
+  // no focused RenderWidgetHost or no layout answer, |success| is false.
+  GetLayoutFirstRectForRange(
+      gfx.mojom.Range requested_range) => (gfx.mojom.Rect out_rect,
+                                           bool success);
+
   // Forward the corresponding edit menu command to the RenderWidgetHost's
   // delegate.
   ExecuteEditCommand(string command);

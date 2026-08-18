@@ -16,6 +16,7 @@
 #import "base/apple/foundation_util.h"
 #include "base/apple/owned_objc.h"
 #include "base/debug/crash_logging.h"
+#include "base/functional/bind.h"
 #import "base/mac/mac_util.h"
 #include "base/memory/raw_ptr.h"
 #include "base/numerics/safe_conversions.h"
@@ -520,15 +521,50 @@ static NSWindow* __weak _deferredResignKeyWindow;
   if (!candidateResult)
     return;
 
-  NSRect textRectInScreenCoordinates =
-      [self firstRectForCharacterRange:candidateResult.range
-                           actualRange:nullptr];
-  NSRect textRectInWindowCoordinates =
-      [self.window convertRectFromScreen:textRectInScreenCoordinates];
-  NSRect textRectInViewCoordinates =
-      [self convertRect:textRectInWindowCoordinates fromView:nil];
-
+  // Anchor the indicator from the renderer's layout, not from
+  // -firstRectForCharacterRange:, whose IME caches may approximate a word
+  // range's rect with the caret's. The layout answer arrives asynchronously;
+  // the indicator is shown when it does.
   NSUInteger capturedChangeCounter = _availableTextChangeCounter;
+  _host->GetLayoutFirstRectForRange(
+      gfx::Range::FromPossiblyInvalidNSRange(candidateResult.range),
+      base::BindOnce(^(const gfx::Rect& layoutRect, bool success) {
+        [self showSubstitutionIndicatorForResult:candidateResult
+                                      layoutRect:layoutRect
+                                 layoutRectValid:success
+                                withChangeNumber:capturedChangeCounter];
+      }));
+}
+
+- (void)showSubstitutionIndicatorForResult:(NSTextCheckingResult*)candidateResult
+                                layoutRect:(gfx::Rect)gfxRect
+                           layoutRectValid:(bool)success
+                          withChangeNumber:(NSUInteger)capturedChangeCounter {
+  // The offer was computed against the text as it stood when the check ran.
+  // If the text changed while the layout answer was in flight, the offer is
+  // stale; the check that ran on the newer text makes its own offer.
+  if (_availableTextChangeCounter != capturedChangeCounter)
+    return;
+
+  NSRect textRectInViewCoordinates = NSZeroRect;
+  if (success) {
+    // The returned rectangle has a top-left origin; flip it into this
+    // view's coordinate system.
+    NSRect rect = gfxRect.ToCGRect();
+    rect.origin.y = NSHeight(self.frame) - NSMaxY(rect);
+    textRectInViewCoordinates = rect;
+  } else {
+    // EditContext-style editors report caret and selection bounds but
+    // produce no layout rect for an arbitrary range; fall back to the
+    // cached path rather than never offering there.
+    NSRect textRectInScreenCoordinates =
+        [self firstRectForCharacterRange:candidateResult.range
+                             actualRange:nullptr];
+    NSRect textRectInWindowCoordinates =
+        [self.window convertRectFromScreen:textRectInScreenCoordinates];
+    textRectInViewCoordinates =
+        [self convertRect:textRectInWindowCoordinates fromView:nil];
+  }
 
   [self.spellChecker
       showCorrectionIndicatorOfType:NSCorrectionIndicatorTypeDefault

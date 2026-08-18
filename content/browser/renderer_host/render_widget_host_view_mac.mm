@@ -2388,6 +2388,43 @@ void RenderWidgetHostViewMac::SyncGetFirstRectForRange(
   std::move(callback).Run(out_rect, out_actual_range, success);
 }
 
+void RenderWidgetHostViewMac::GetLayoutFirstRectForRange(
+    const gfx::Range& requested_range,
+    GetLayoutFirstRectForRangeCallback callback) {
+  TRACE_EVENT1("ime", "RenderWidgetHostViewMac::GetLayoutFirstRectForRange",
+               "requested range", requested_range.ToString());
+
+  if (!GetFocusedWidget()) {
+    std::move(callback).Run(gfx::Rect(), false);
+    return;
+  }
+
+  TextInputClientMac::GetInstance()->AsyncGetFirstRectForRange(
+      GetFocusedWidget(), requested_range,
+      base::BindOnce(&RenderWidgetHostViewMac::OnGotLayoutFirstRectForRange,
+                     weak_factory_.GetWeakPtr(), std::move(callback)));
+}
+
+void RenderWidgetHostViewMac::OnGotLayoutFirstRectForRange(
+    GetLayoutFirstRectForRangeCallback callback,
+    gfx::Rect blink_rect) {
+  if (blink_rect.IsEmpty()) {
+    std::move(callback).Run(gfx::Rect(), false);
+    return;
+  }
+
+  // With zoom-for-dsf, RenderWidgetHost coordinate system is physical points,
+  // which means we have to scale the rect by the device scale factor.
+  gfx::Rect rect =
+      gfx::ScaleToEnclosingRect(blink_rect, 1.f / GetDeviceScaleFactor());
+
+  // Ensure the returned rect is clamped to the viewport to prevent a
+  // compromised renderer from placing IME windows outside the page.
+  // See https://crbug.com/519210950.
+  rect.AdjustToFit(gfx::Rect(GetVisibleViewportSize()));
+  std::move(callback).Run(rect, true);
+}
+
 void RenderWidgetHostViewMac::ExecuteEditCommand(const std::string& command) {
   if (host()->delegate()) {
     host()->delegate()->ExecuteEditCommand(command, std::nullopt);

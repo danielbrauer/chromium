@@ -430,6 +430,9 @@ class CONTENT_EXPORT RenderWidgetHostViewMac
                                 gfx::Rect* out_rect,
                                 gfx::Range* out_actual_range,
                                 bool* out_success) override;
+  void GetLayoutFirstRectForRange(
+      const gfx::Range& requested_range,
+      GetLayoutFirstRectForRangeCallback callback) override;
   void ExecuteEditCommand(const std::string& command) override;
   void Undo() override;
   void Redo() override;
@@ -567,6 +570,10 @@ class CONTENT_EXPORT RenderWidgetHostViewMac
       int32_t targetWidgetRoutingId,
       ui::mojom::AttributedStringPtr attributed_string,
       const gfx::Point& baseline_point_in_layout_space);
+
+  void OnGotLayoutFirstRectForRange(
+      GetLayoutFirstRectForRangeCallback callback,
+      gfx::Rect blink_rect);
 
   // RenderWidgetHostViewBase:
   void UpdateBackgroundColor() override;
