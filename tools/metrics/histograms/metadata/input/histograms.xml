@@ -1091,6 +1091,22 @@ chromium-metrics-reviews@google.com.
   <summary>Time taken by the engine to handle a key event.</summary>
 </histogram>
 
+<histogram name="InputMethod.MacTextSubstitution.Response"
+    enum="MacTextSubstitutionResponse" expires_after="2027-08-18">
+  <owner>messagetodaniel@gmail.com</owner>
+  <owner>file://content/app_shim_remote_cocoa/OWNERS</owner>
+  <summary>
+    How a macOS text-substitution offer ended (Text Replacement, smart
+    quotes/dashes, or automatic spelling correction behind
+    MacAutomaticSpellingCorrection): a shown correction-indicator offer was
+    accepted, rejected or ignored; a never-shown offer applied silently at a
+    word boundary; or the user manually restored an applied correction
+    (reverted). Recorded when the outcome is decided, in all profile types; the
+    spell-checker learning write these outcomes accompany is what off-the-record
+    withholds, not this count. macOS only.
+  </summary>
+</histogram>
+
 <histogram name="InputMethod.Manta.Orca.CharactersInserted.{Mode}"
     units="characters" expires_after="2026-12-01">
   <owner>hdchuong@google.com</owner>

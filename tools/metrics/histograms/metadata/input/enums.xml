@@ -684,6 +684,18 @@ Unsupported non-ascii characters will cause issues with xml presubmits.
   <int value="3" label="Installed"/>
 </enum>
 
+<!-- LINT.IfChange(MacTextSubstitutionResponse) -->
+
+<enum name="MacTextSubstitutionResponse">
+  <int value="0" label="Accepted (shown offer taken, by click or boundary)"/>
+  <int value="1" label="Rejected (Escape or the indicator's dismiss control)"/>
+  <int value="2" label="Ignored (shown offer abandoned)"/>
+  <int value="3" label="Reverted (applied correction manually restored)"/>
+  <int value="4" label="Applied silently at a word boundary (never shown)"/>
+</enum>
+
+<!-- LINT.ThenChange(//content/app_shim_remote_cocoa/text_substitution_controller.mm:MacTextSubstitutionResponse) -->
+
 <enum name="MetaTagTypeEnum">
   <int value="0" label="No viewport tag"/>
   <int value="1" label="Viewport meta with device width"/>

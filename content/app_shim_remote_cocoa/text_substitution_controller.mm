@@ -6,6 +6,7 @@
 
 #include "base/feature_list.h"
 #include "base/functional/bind.h"
+#include "base/metrics/histogram_functions.h"
 #include "base/strings/sys_string_conversions.h"
 #include "base/time/time.h"
 #include "base/timer/timer.h"
@@ -21,6 +22,25 @@ constexpr base::TimeDelta kSubstitutionIndicatorPause = base::Milliseconds(300);
 // text updates never arrive; a stale check is harmless, an unbounded count
 // is not.
 constexpr NSUInteger kMaxPendingTextSubstitutionChecks = 16;
+
+// How a substitution offer ended, from the user's point of view. These
+// values are persisted to logs. Entries should not be renumbered and numeric
+// values should never be reused.
+// LINT.IfChange(MacTextSubstitutionResponse)
+enum class MacTextSubstitutionResponse {
+  kAccepted = 0,
+  kRejected = 1,
+  kIgnored = 2,
+  kReverted = 3,
+  kAppliedSilently = 4,
+  kMaxValue = kAppliedSilently,
+};
+// LINT.ThenChange(//tools/metrics/histograms/metadata/input/enums.xml:MacTextSubstitutionResponse)
+
+void RecordSubstitutionResponseMetric(MacTextSubstitutionResponse response) {
+  base::UmaHistogramEnumeration("InputMethod.MacTextSubstitution.Response",
+                                response);
+}
 
 }  // namespace
 
@@ -466,9 +486,27 @@ constexpr NSUInteger kMaxPendingTextSubstitutionChecks = 16;
                       toCorrection:(NSString*)correction
                            forWord:(NSString*)word
                           language:(NSString*)language {
+  switch (response) {
+    case NSCorrectionResponseAccepted:
+      RecordSubstitutionResponseMetric(MacTextSubstitutionResponse::kAccepted);
+      break;
+    case NSCorrectionResponseRejected:
+      RecordSubstitutionResponseMetric(MacTextSubstitutionResponse::kRejected);
+      break;
+    case NSCorrectionResponseIgnored:
+      RecordSubstitutionResponseMetric(MacTextSubstitutionResponse::kIgnored);
+      break;
+    case NSCorrectionResponseReverted:
+      RecordSubstitutionResponseMetric(MacTextSubstitutionResponse::kReverted);
+      break;
+    case NSCorrectionResponseNone:
+    case NSCorrectionResponseEdited:
+      break;
+  }
   // Off-the-record typing must not train the per-user correction model, as
   // WebKit ephemeral sessions do with CorrectionPanel. Corrections still
-  // apply; only the learning write is withheld.
+  // apply; only the learning write is withheld. The aggregate count above is
+  // not a per-user learning write and is recorded regardless.
   if ([_client isOffTheRecord]) {
     return;
   }
@@ -576,16 +614,21 @@ constexpr NSUInteger kMaxPendingTextSubstitutionChecks = 16;
   }
 
   // An offer the user saw and then completed with a boundary is an
-  // acceptance; at typing speed nothing was shown and nothing is recorded.
+  // acceptance; at typing speed nothing was shown and nothing is recorded
+  // with the checker.
   BOOL wasShown = _pendingSubstitutionWasShown;
   if ([self applySubstitution:correction
                    withString:correction.replacementString
-           ifTextStillMatches:_pendingSubstitutionOriginal] &&
-      wasShown) {
-    [self recordSubstitutionResponse:NSCorrectionResponseAccepted
-                        toCorrection:correction.replacementString
-                             forWord:_pendingSubstitutionOriginal
-                            language:_pendingSubstitutionLanguage];
+           ifTextStillMatches:_pendingSubstitutionOriginal]) {
+    if (wasShown) {
+      [self recordSubstitutionResponse:NSCorrectionResponseAccepted
+                          toCorrection:correction.replacementString
+                               forWord:_pendingSubstitutionOriginal
+                              language:_pendingSubstitutionLanguage];
+    } else {
+      RecordSubstitutionResponseMetric(
+          MacTextSubstitutionResponse::kAppliedSilently);
+    }
   }
   [self clearPendingSubstitution];
 }
